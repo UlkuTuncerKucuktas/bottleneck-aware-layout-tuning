@@ -57,10 +57,32 @@ submit() {
     previous="$jobid"
 }
 
-# 32 cores where the sweep needs them, 16 otherwise. The partition wants one GPU
-# per 16 cores, so the two go together.
-WIDE="--cpus-per-task=32 --gres=gpu:2 slurm/single.sbatch"
-NARROW="slurm/single.sbatch"
+# Where the jobs go. The scripts carry kolyoz-cuda defaults in their #SBATCH
+# directives; set these to run the same campaign anywhere else, since a
+# partition name, an account and a GPU ratio are all site-specific:
+#
+#   LAYOUT_PARTITION=barbun LAYOUT_ACCOUNT=<acct> LAYOUT_GRES= ./slurm/run_campaign.sh
+#
+# LAYOUT_GRES set but EMPTY means "request no GPU", which is what a CPU
+# partition needs; leaving it unset keeps the GPU request the cuda partitions
+# demand. No experiment here uses a GPU either way.
+COMMON=""
+[ -n "${LAYOUT_PARTITION-}" ] && COMMON="$COMMON -p $LAYOUT_PARTITION"
+[ -n "${LAYOUT_ACCOUNT-}" ]   && COMMON="$COMMON -A $LAYOUT_ACCOUNT"
+
+if [ "${LAYOUT_GRES-gpu:1}" = "" ]; then
+    GRES_NARROW=""
+    GRES_WIDE=""
+else
+    GRES_NARROW="--gres=${LAYOUT_GRES-gpu:1}"
+    # One GPU per 16 cores where the ratio is enforced, so 32 cores needs two.
+    GRES_WIDE="--gres=${LAYOUT_GRES_WIDE-gpu:2}"
+fi
+
+# 32 cores where the sweep needs them, 16 otherwise.
+WIDE="$COMMON --cpus-per-task=32 $GRES_WIDE slurm/single.sbatch"
+NARROW="$COMMON $GRES_NARROW slurm/single.sbatch"
+MULTI="$COMMON $GRES_NARROW slurm/multi.sbatch"
 
 echo "jobid       experiment"
 submit "$WIDE"   stripe_grid
@@ -74,10 +96,10 @@ submit "$NARROW" bottleneck_budget
 # neighbour_cost first: it needs only 2 nodes and it needs them exclusively, so
 # queuing it behind the 8-node job would make a cheap measurement hostage to the
 # most expensive one in the campaign.
-submit "--exclusive -N 2 slurm/multi.sbatch" neighbour_cost
-submit "-N 2 slurm/multi.sbatch" mds_scaling
-submit "-N 4 slurm/multi.sbatch" mds_scaling
-submit "-N 8 slurm/multi.sbatch" mds_scaling
+submit "--exclusive -N 2 $MULTI" neighbour_cost
+submit "-N 2 $MULTI" mds_scaling
+submit "-N 4 $MULTI" mds_scaling
+submit "-N 8 $MULTI" mds_scaling
 
 echo
 echo "chain submitted. watch with:  squeue -u \$USER"

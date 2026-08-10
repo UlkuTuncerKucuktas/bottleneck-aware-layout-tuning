@@ -352,3 +352,24 @@ and locks a layout entry per configured target on every open, whether or not it
 holds anything. That is the cost of asking for width you cannot use, and it is
 the regime small-file workloads live in. A 64 MiB arm was added alongside so
 that placement can vary too, and the two mechanisms can be told apart.
+
+## Running the campaign on a different cluster
+
+The `#SBATCH` directives carry `kolyoz-cuda` defaults. Three environment
+variables move the whole campaign elsewhere without editing any file:
+
+    LAYOUT_PARTITION=barbun \
+    LAYOUT_ACCOUNT=<account> \
+    LAYOUT_GRES= \
+    LAYOUT_SCRATCH=/arf/scratch/$USER/layout-tuning-barbun \
+    ./slurm/run_campaign.sh
+
+`LAYOUT_GRES` set but empty means request no GPU, which is what a CPU partition
+needs. Leaving it unset keeps the GPU request the cuda partitions demand, since
+they reject jobs without one. No experiment uses a GPU either way.
+
+`LAYOUT_SCRATCH` must differ per cluster. The TRUBA clusters mount the same
+/arf, so a shared directory would let resume fill the gaps in one curve with
+points measured on different client hardware.
+
+Always `--dry-run` first: it prints every sbatch line and submits nothing.
