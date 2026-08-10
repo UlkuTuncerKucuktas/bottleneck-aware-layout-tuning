@@ -520,3 +520,29 @@ beside another cluster's. `slurm/barbun.env` holds the barbun-cuda values:
 `run_campaign.sh` now prints scratch, partition, account and core counts before
 submitting anything, so a dropped variable is visible in the first four lines
 rather than inferred later from a confusing ledger.
+
+## Evicting without privilege
+
+`ldlm.namespaces.*.lru_size` is not writable by an ordinary user on every
+cluster, and it is not needed. Three strategies, in the order `evict()` tries
+them:
+
+    LDLM namespace   coldest, needs write access to /proc/fs/lustre
+    write flush      the data-version ioctl on an O_WRONLY descriptor
+    fadvise          open O_RDONLY and drop pages -- LAST RESORT
+
+The ordering matters more than the fallback. The ioctl pushes data to the server
+and releases the write lock, and because it opens the file write-only it never
+takes the read lock. Dropping pages does take one, and a cached read lock is
+exactly what stops the server sending file data in the open reply -- so the
+fadvise path silently turns every DoM arm into an ordinary OST measurement.
+
+The earlier standalone run on this filesystem, as an unprivileged user, got a
+3.91x DoM speedup with the write flush and nothing else. Its unflushed rows
+show the contrast directly: 0.97x at 64 KiB when neither arm was evicted,
+3.91x when both were.
+
+`slurm/evict_probe.py` measures all three on identical files and prints the
+open/read split for each. Inlining is unmistakable in that split -- an
+expensive open and a nearly free read -- so the probe settles which strategy
+works on a given cluster rather than leaving it to argument.

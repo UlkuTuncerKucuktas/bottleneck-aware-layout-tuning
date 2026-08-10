@@ -163,13 +163,14 @@ def _report_eviction_mode():
             "struct layout is unverified")
 
     if drop_client_locks():
-        log("eviction: LDLM locks and pages both dropped (DoM measurable cold)")
+        log("eviction: LDLM lock namespace (privileged path, coldest available)")
     else:
-        log("WARNING: cannot write ldlm.namespaces.*.lru_size, so client locks "
-            "cannot be dropped. Eviction falls back to opening each file, which "
-            "caches the DoM lock and suppresses inlining -- every DoM arm will "
-            "look like an ordinary OST file. DoM results from this run are NOT "
-            "valid. Ask an admin for access, or run the OST-only experiments.")
+        log("eviction: write-flush ioctl (unprivileged; lru_size is not writable "
+            "here). The flush opens files write-only, so it does not take the "
+            "read lock that suppresses DoM inlining -- unlike dropping pages "
+            "via fadvise, which does. Confirm with slurm/evict_probe.py that "
+            "DoM's read time stays well under its open time; if it does not, "
+            "the DoM arms are measuring warm and only the OST results stand.")
 
 
 def _preflight():

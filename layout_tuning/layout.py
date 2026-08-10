@@ -110,6 +110,27 @@ def drop_client_locks():
     return dropped
 
 
+def evict_by_flush(paths):
+    """Drop each file's cached data and lock using only the write-flush ioctl.
+
+    The ioctl pushes dirty data to the server and releases the write lock, so
+    the next read starts cold -- the same mechanism that makes a freshly
+    written file measurable at all. It needs no privilege, unlike the LDLM
+    namespace, and it opens the files O_WRONLY, so it never takes the read lock
+    that suppresses DoM inlining.
+
+    Whether this leaves the client as cold as an LDLM flush is a question for
+    measurement, not assumption: slurm/evict_probe.sh compares the strategies
+    and prints the open/read split that distinguishes them.
+    """
+    for path in paths:
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            flush_dom_lock(fd)
+        finally:
+            os.close(fd)
+
+
 def evict(paths):
     """Return the client to a cold state: no cached pages, and no cached locks.
 
@@ -135,9 +156,17 @@ def evict(paths):
             "these measurements require Linux")
 
     if not drop_client_locks():
-        for path in paths:
-            fd = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-            os.close(fd)
+        # No privilege for the LDLM namespace. Fall back to the write-flush
+        # ioctl, which opens O_WRONLY and so does not take the read lock that
+        # the fadvise path takes -- that read lock is what makes a DoM arm
+        # measure as an ordinary OST file. Page-only eviction is kept below it
+        # as a last resort for files this process cannot open for writing.
+        try:
+            evict_by_flush(paths)
+        except OSError:
+            for path in paths:
+                fd = os.open(path, os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
     run("sync")
     time.sleep(0.5)
