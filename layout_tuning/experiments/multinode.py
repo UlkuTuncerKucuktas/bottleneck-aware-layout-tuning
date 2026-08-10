@@ -8,11 +8,23 @@ from ..probes import profile_reads
 from ..runner import experiment, measured, median_by, rows, log
 
 
-def _rendezvous(tag, rank, nodes):
-    """Wait until every client has reached this point, using the shared filesystem."""
-    marker = f"{SCRATCH}/barrier_{tag}"
+def _rendezvous(tag, rank, nodes, timeout=600):
+    """Wait until every client has reached this point, using the shared filesystem.
+
+    The tag carries the node count and the job id: markers left behind by an
+    earlier or killed run would otherwise satisfy a later barrier immediately,
+    letting some ranks read while others are still writing -- which silently
+    destroys the concurrency the experiment exists to create.
+    """
+    job = os.environ.get("SLURM_JOB_ID", "local")
+    marker = f"{SCRATCH}/barrier_{job}_{nodes}_{tag}"
     open(f"{marker}_{rank}", "w").close()
+    deadline = time.time() + timeout
     while sum(1 for n in range(nodes) if os.path.exists(f"{marker}_{n}")) < nodes:
+        if time.time() > deadline:
+            raise RuntimeError(
+                f"rank {rank} waited {timeout}s at barrier {tag} for {nodes} clients; "
+                "a peer never arrived, so this measurement would not be concurrent")
         time.sleep(0.3)
 
 
@@ -28,7 +40,7 @@ def mds_scaling(rank, nodes):
         cell = f"mds_scaling/{nodes}/{arm}/{rank}"
 
         def body(arm=arm, layout=layout):
-            directory = fresh_dir(f"{SCRATCH}/mds_{arm}_{rank}", layout)
+            directory = fresh_dir(f"{SCRATCH}/mds_{arm}_{nodes}_{rank}", layout)
             paths, _ = write_files(directory, 6000, 32 << 10)
             evict(paths)
             _rendezvous(arm, rank, nodes)
@@ -62,7 +74,7 @@ def neighbour_cost(rank, nodes):
 
         def body(label=label, neighbour_layout=neighbour_layout):
             layout = OST_PLAIN if rank == 0 else neighbour_layout
-            directory = fresh_dir(f"{SCRATCH}/neigh_{label}_{rank}", layout)
+            directory = fresh_dir(f"{SCRATCH}/neigh_{label}_{nodes}_{rank}", layout)
             paths, _ = write_files(directory, file_count, file_size, flush=False)
             evict(paths)
             _rendezvous(label, rank, nodes)

@@ -107,6 +107,15 @@ across passes, so the floor lengthens one timed region rather than summing short
 ones. Rows carry `read_s` and `passes` so a cell that never reached the floor is
 visible.
 
+## pool_selection writes to a shared tier
+
+`pool_selection` is the only experiment that writes outside the pool scratch
+inherits. With the defaults (512 files of 4 MiB, two widths, three repeats) each
+pool arm writes 6 x 2 GiB = 12 GiB, so a two-pool filesystem sees 24 GiB in
+total and half of it lands on the capacity tier other users' jobs sit on. It is
+deleted as each cell finishes, but the write bandwidth is real while it runs.
+Lower it with LAYOUT_REPEATS=1 for a first look.
+
 ## Running the whole campaign
 
     ./slurm/run_campaign.sh --dry-run    # see the sbatch calls
@@ -117,3 +126,15 @@ at a time and the script returns as soon as everything is queued. `afterany`
 rather than `afterok` because a job that hits its time limit still leaves
 finished cells in the ledger, and the next experiment does not depend on its
 predecessor completing.
+
+## Multi-node runs share the filesystem, so names must carry the run
+
+Every rank of every job writes into the same scratch directory, so a path built
+from only the arm and the rank collides between a 2-node and a 4-node run of the
+same experiment. Scratch directories therefore include the node count, and the
+rendezvous barrier includes the job id as well: a marker file left behind by a
+killed run would otherwise satisfy a later barrier immediately, letting some
+ranks read while others are still writing. That produces a plausible-looking
+number with none of the concurrency the experiment exists to create, which is
+worse than a crash. The barrier also gives up after ten minutes rather than
+holding the allocation until the wall clock ends.

@@ -28,8 +28,9 @@ if [ -f "$SCRATCH/results.jsonl" ]; then
         echo "warning: $SCRATCH/results.jsonl holds $stale rows from superseded code."
         echo "         Those cells will be SKIPPED, not remeasured. To redo them:"
         echo
+        echo "  cd $SCRATCH && cp results.jsonl results.jsonl.bak"
         echo "  grep -vE '\"cell\": \"(stripe_grid|bottleneck_budget/(minimal|wide))/' \\"
-        echo "      $SCRATCH/results.jsonl > \$TMPDIR/keep && mv \$TMPDIR/keep $SCRATCH/results.jsonl"
+        echo "      results.jsonl > results.keep && mv results.keep results.jsonl"
         echo
         read -r -p "submit anyway? [y/N] " reply
         [ "$reply" = "y" ] || exit 1
