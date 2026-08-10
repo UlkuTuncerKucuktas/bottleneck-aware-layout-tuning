@@ -1,6 +1,7 @@
 """Reading and writing files, and querying what the filesystem says about them."""
 
 import os, time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from .layout import CHUNK, SCRATCH, capture, flush_dom_lock, run
@@ -62,21 +63,46 @@ def read_whole(path):
 
 
 
-def read_many(paths, threads):
-    started = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=threads) as pool:
+def prewarm(pool, threads):
+    """Force every worker thread to exist before the caller starts timing.
+
+    ThreadPoolExecutor spawns lazily, so a timer started around `pool.map` also
+    measures thread creation. At a few hundred MiB per pass that startup cost is
+    a large share of the measurement, and it grows with the thread count -- which
+    is exactly the axis being swept, so it masquerades as a concurrency effect.
+    A barrier makes all workers exist first: each task blocks until every worker
+    has arrived, so the pool is fully populated when the barrier releases.
+    """
+    barrier = threading.Barrier(threads + 1)
+    for _ in range(threads):
+        pool.submit(barrier.wait)
+    barrier.wait()
+
+
+def read_many(paths, threads, pool=None):
+    if pool is not None:
+        started = time.perf_counter()
         total = sum(pool.map(read_whole, paths))
-    return time.perf_counter() - started, total
+        return time.perf_counter() - started, total
+    with ThreadPoolExecutor(max_workers=threads) as own:
+        prewarm(own, threads)
+        started = time.perf_counter()
+        total = sum(own.map(read_whole, paths))
+        return time.perf_counter() - started, total
 
 
 def read_until(paths, threads, min_seconds, reader=None):
     """Read `paths` repeatedly until the timed region lasts `min_seconds`.
 
-    A cell that finishes in tens of milliseconds measures thread startup and
-    first-RPC latency rather than steady-state throughput, and on a flash pool a
-    few hundred MiB is exactly that short. Re-reading the same set keeps the
-    write volume affordable; the cache is dropped before each pass so every pass
-    still goes to the servers.
+    Re-reading keeps the write volume affordable, but averaging N independent
+    passes does not remove a fixed per-pass cost: with c of startup and w/r of
+    transfer, N*w / (N*(c + w/r)) equals the single-pass rate exactly. The floor
+    therefore has to make one timed region long, not add short ones together.
+
+    So the thread pool is created and populated once, outside the timing, and
+    reused for every pass; only the cache drop between passes is excluded. What
+    remains inside the timed region is transfer plus per-pass RPC latency, which
+    is the quantity being measured rather than a constant to be diluted.
 
     Returns (seconds, bytes, passes) so a cell that could not reach the floor is
     visible in the row rather than silently short.
@@ -85,14 +111,14 @@ def read_until(paths, threads, min_seconds, reader=None):
 
     reader = reader or read_many
     total_bytes, elapsed, passes = 0, 0.0, 0
-    while elapsed < min_seconds:
-        evict(paths)
-        took, got = reader(paths, threads)
-        elapsed += took
-        total_bytes += got
-        passes += 1
-        if passes >= 50:
-            break
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        prewarm(pool, threads)
+        while elapsed < min_seconds and passes < 50:
+            evict(paths)
+            took, got = reader(paths, threads, pool=pool)
+            elapsed += took
+            total_bytes += got
+            passes += 1
     return elapsed, total_bytes, passes
 
 
@@ -115,13 +141,54 @@ def read_ranges(path, size_bytes, threads):
         return got
 
     try:
-        started = time.perf_counter()
         with ThreadPoolExecutor(max_workers=threads) as pool:
+            prewarm(pool, threads)
+            started = time.perf_counter()
             total = sum(pool.map(worker, bounds))
-        elapsed = time.perf_counter() - started
+            elapsed = time.perf_counter() - started
     finally:
         os.close(fd)
     return elapsed, total
+
+
+def ranged_reader(path, size_bytes):
+    """A read_until-compatible reader for disjoint ranges of one file.
+
+    Returned as a callable that accepts an existing pool, so the shared-file arm
+    gets the same one-pool-per-cell treatment as the whole-file arm rather than
+    paying thread creation on every pass.
+    """
+    def read(paths, threads, pool=None):
+        fd = os.open(path, os.O_RDONLY)
+        span = size_bytes // threads
+        bounds = [(k * span, size_bytes if k == threads - 1 else (k + 1) * span)
+                  for k in range(threads)]
+
+        def worker(bound):
+            start, end = bound
+            got, offset = 0, start
+            while offset < end:
+                chunk = os.pread(fd, min(CHUNK, end - offset), offset)
+                if not chunk:
+                    break
+                offset += len(chunk)
+                got += len(chunk)
+            return got
+
+        try:
+            if pool is not None:
+                started = time.perf_counter()
+                total = sum(pool.map(worker, bounds))
+                return time.perf_counter() - started, total
+            with ThreadPoolExecutor(max_workers=threads) as own:
+                prewarm(own, threads)
+                started = time.perf_counter()
+                total = sum(own.map(worker, bounds))
+                return time.perf_counter() - started, total
+        finally:
+            os.close(fd)
+
+    return read
 
 
 def mdt_used_kib():

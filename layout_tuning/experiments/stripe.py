@@ -3,7 +3,8 @@
 import os, time, shutil
 
 from ..layout import SCRATCH, OST_PLAIN, OST_WIDE, dom_layout, fresh_dir, evict
-from ..io import (write_files, read_many, read_ranges, read_until, mdt_used_kib,
+from ..io import (write_files, read_many, read_ranges, ranged_reader, read_until,
+                  mdt_used_kib,
                   osts_per_file, stat_rate, burn_cpu, restricted_to_cores,
                   allocated_cores, pool_names, pool_members, inherited_pool,
                   target_inventory)
@@ -28,9 +29,10 @@ def stripe_grid():
     bytes_per_cell = 2 << 30
     min_seconds = 2.0
     # 2 GiB of 0.25 MiB files would be 8192 files per cell, which measures
-    # metadata rate rather than stripe behaviour, so the small arm keeps its
-    # file count and reaches the duration floor by re-reading instead.
-    cell_bytes = {0.25: 256 << 20, 4: bytes_per_cell}
+    # metadata rate more than stripe behaviour. 1 GiB is the compromise: 4096
+    # files is still a dataloader-shaped set, and each pass is long enough that
+    # per-pass RPC latency does not dominate it.
+    cell_bytes = {0.25: 1 << 30, 4: bytes_per_cell}
     thread_levels = [1, 2, 4, 8, 16, 32]
     stripe_levels = [1, 4, 8, 16, -1]
     for pattern in ["fpw", "shared"]:
@@ -58,7 +60,7 @@ def stripe_grid():
                                                             flush=False)
                                 elapsed, total, passes = read_until(
                                     paths, threads, min_seconds,
-                                    reader=lambda ps, n: read_ranges(ps[0], bytes_per_cell, n))
+                                    reader=ranged_reader(paths[0], bytes_per_cell))
                             row = {"pattern": pattern, "size_mib": size_mib,
                                    "files_per_thread": len(paths) / threads,
                                    "read_s": elapsed, "passes": passes,

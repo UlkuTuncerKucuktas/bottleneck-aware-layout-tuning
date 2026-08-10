@@ -86,3 +86,34 @@ experiment except `stripe_grid`, whose thread sweep reaches 32:
 
 Run everything on Lustre under `/arf/scratch`, never on node-local storage, and
 never on a login node.
+
+## Measuring throughput on flash
+
+A single flash OST on TRUBA serves roughly 2.9 GiB/s to one thread, so a
+few hundred MiB is read in tens of milliseconds. Two things follow, and the
+first run of `stripe_grid` fell into both.
+
+Thread-pool creation must sit outside the timed region. `ThreadPoolExecutor`
+spawns workers lazily, so timing around `pool.map` also times thread creation --
+a cost that grows with the thread count, which is the axis being swept. It shows
+up as throughput falling at high concurrency and is easily mistaken for a real
+client-side ceiling. `read_many` and `ranged_reader` now populate the pool with
+a barrier before starting the clock.
+
+Re-reading does not by itself dilute a fixed per-pass cost. Averaging N passes
+that each pay `c` of startup gives `N*w / (N*(c + w/r))`, which is exactly the
+single-pass rate. `read_until` therefore builds one pool per cell and reuses it
+across passes, so the floor lengthens one timed region rather than summing short
+ones. Rows carry `read_s` and `passes` so a cell that never reached the floor is
+visible.
+
+## Running the whole campaign
+
+    ./slurm/run_campaign.sh --dry-run    # see the sbatch calls
+    ./slurm/run_campaign.sh              # submit the chain, then walk away
+
+Each job carries `--dependency=afterany` on the one before it, so they run one
+at a time and the script returns as soon as everything is queued. `afterany`
+rather than `afterok` because a job that hits its time limit still leaves
+finished cells in the ledger, and the next experiment does not depend on its
+predecessor completing.
