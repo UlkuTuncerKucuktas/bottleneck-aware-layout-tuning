@@ -47,6 +47,13 @@ stripe occupies a single OST whatever the count says. `stripe_grid` sweeps
 sizes on both sides of the stripe size so this shows up as a flat row rather
 than a puzzle.
 
+**`-c -1` is not necessarily every OST.** On TRUBA's `/arf` (48 OSTs) a file
+created with `-c -1` came back from `lfs getstripe -c` with **24** objects, not
+48. Take the per-file stripe count from `lfs getstripe`, never from the
+filesystem's OST count: they are different numbers and the second one flatters
+the footprint figure. `stripe_grid` now records `osts_per_file` in every row so
+the requested and the granted width can be compared.
+
 **Never measure on a login node.** Its client-side cache and lock state carry
 whatever every other logged-in user is doing.
 

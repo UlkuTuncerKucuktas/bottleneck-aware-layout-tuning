@@ -53,26 +53,33 @@ def neighbour_cost(rank, nodes):
     The other ranks read the same volume, once on a minimal layout and once
     on a wide one, so the difference is what the surplus cost the victim.
     """
+    # 16 MiB files, so the neighbour's wide layout genuinely spreads across OSTs.
+    # With small files every arm lands on one OST and there is nothing to measure.
+    file_size, file_count = 16 << 20, 128
     for label, neighbour_layout in [("minimal", OST_PLAIN), ("wide", OST_WIDE)]:
         cell = f"neighbour_cost/{label}/{rank}"
 
         def body(label=label, neighbour_layout=neighbour_layout):
             layout = OST_PLAIN if rank == 0 else neighbour_layout
             directory = fresh_dir(f"{SCRATCH}/neigh_{label}_{rank}", layout)
-            paths, _ = write_files(directory, 2048, 256 << 10, flush=False)
+            paths, _ = write_files(directory, file_count, file_size, flush=False)
             evict(paths)
             _rendezvous(label, rank, nodes)
             elapsed, total = read_many(paths, threads=8)
             row = {"neighbour_layout": label, "rank": rank, "files": len(paths),
                    "role": "victim" if rank == 0 else "neighbour",
+                   "read_s": elapsed,
                    "mib_per_s": total / elapsed / (1 << 20),
-                   "osts_per_file": osts_per_file(paths[0])}
+                   "osts_per_file": osts_per_file(paths[0]),
+                   "ost_objects": len(paths) * osts_per_file(paths[0])}
             shutil.rmtree(directory, ignore_errors=True)
             return row
 
         measured(cell, body)
     if rank == 0:
         seen = rows("neighbour_cost/")
+        quiet = median_by(seen, "mib_per_s", neighbour_layout="minimal", rank=0)
         for label in ["minimal", "wide"]:
-            log(f"neighbour_cost {label:>7}: victim "
-                f"{median_by(seen, 'mib_per_s', neighbour_layout=label, rank=0):.0f} MiB/s")
+            got = median_by(seen, "mib_per_s", neighbour_layout=label, rank=0)
+            log(f"neighbour_cost neighbour={label:>7}: victim {got:.0f} MiB/s"
+                + ("" if label == "minimal" else f"  ({got / quiet:.2f}x of the minimal case)"))

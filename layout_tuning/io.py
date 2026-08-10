@@ -98,18 +98,38 @@ def read_ranges(path, size_bytes, threads):
 
 
 def mdt_used_kib():
-    for line in capture(f"lfs df {SCRATCH}").splitlines():
-        if "[MDT:" in line:
-            return int(line.split()[2])
-    raise RuntimeError("no MDT line in lfs df")
+    """Space used across *every* metadata target, not just the first.
+
+    A filesystem usually has several MDTs and a directory's files can land on
+    any of them, so reading one line undercounts by roughly the MDT count.
+    """
+    used = [int(line.split()[2]) for line in capture(f"lfs df {SCRATCH}").splitlines()
+            if "[MDT:" in line]
+    if not used:
+        raise RuntimeError("no MDT line in lfs df")
+    return sum(used)
+
+
+def target_counts():
+    text = capture(f"lfs df {SCRATCH}")
+    return (sum(1 for line in text.splitlines() if "[MDT:" in line),
+            sum(1 for line in text.splitlines() if "[OST:" in line))
 
 
 def ost_count():
-    return sum(1 for line in capture(f"lfs df {SCRATCH}").splitlines() if "[OST:" in line)
+    return target_counts()[1]
 
 
 def osts_per_file(path):
-    return int(capture(f"lfs getstripe -c {path}").strip().splitlines()[-1])
+    """How many OST objects this file occupies.
+
+    `lfs getstripe -c` prints one count per layout component, so a composite
+    layout (a DoM file, or any PFL file) yields several lines. The OST cost is
+    the widest component: that is the number of objects actually allocated.
+    """
+    counts = [int(token) for token in capture(f"lfs getstripe -c {path}").split()
+              if token.lstrip("-").isdigit()]
+    return max(counts) if counts else 0
 
 
 def stat_rate(paths):

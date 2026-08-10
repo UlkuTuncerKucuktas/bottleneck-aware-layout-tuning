@@ -12,11 +12,19 @@ from ..runner import experiment, measured, median_by, rows, log, REPEATS
 @experiment("stripe_grid")
 def stripe_grid():
     """Stripe count against reader threads, for whole-file and shared-file reads."""
+    # A file only benefits from N stripes if it spans N of them. The whole-file
+    # sizes bracket the 1 MiB stripe size deliberately: 0.25 MiB fits in a single
+    # stripe however many are requested, so its row should stay flat, and 4 MiB
+    # spans four. Wide striping gets its fair test in the shared arm, which reads
+    # one cell-sized file spanning every level in the sweep, rather than from a
+    # whole-file size large enough to starve the 32-thread cells of files.
     bytes_per_cell = 256 << 20
+    thread_levels = [1, 2, 4, 8, 16, 32]
+    stripe_levels = [1, 4, 8, 16, -1]
     for pattern in ["fpw", "shared"]:
-        for size_mib in ([0.25, 4] if pattern == "fpw" else [4]):
-            for stripe_count in [1, 2, 4, 8, -1]:
-                for threads in [1, 2, 4, 8, 16, 32]:
+        for size_mib in ([0.25, 4] if pattern == "fpw" else [bytes_per_cell >> 20]):
+            for stripe_count in stripe_levels:
+                for threads in thread_levels:
                     for repeat in range(REPEATS):
                         cell = f"stripe_grid/{pattern}/{size_mib}/{stripe_count}/{threads}/{repeat}"
 
@@ -38,6 +46,7 @@ def stripe_grid():
                                 evict(paths)
                                 elapsed, total = read_ranges(paths[0], bytes_per_cell, threads)
                             row = {"pattern": pattern, "size_mib": size_mib,
+                                   "files_per_thread": len(paths) / threads,
                                    "stripe_count": stripe_count, "threads": threads,
                                    "files": len(paths), "read_s": elapsed,
                                    "mib_per_s": total / elapsed / (1 << 20),
@@ -50,26 +59,33 @@ def stripe_grid():
                         measured(cell, body)
             seen = rows(f"stripe_grid/{pattern}/{size_mib}/")
             log(f"{pattern} {size_mib} MiB, read MiB/s by stripes x threads")
-            for stripe_count in [1, 2, 4, 8, -1]:
+            for stripe_count in stripe_levels:
                 line = [median_by(seen, "mib_per_s", stripe_count=stripe_count, threads=t)
-                        for t in [1, 2, 4, 8, 16, 32]]
+                        for t in thread_levels]
                 label = "all" if stripe_count < 0 else str(stripe_count)
                 log(f"   {label:>4}: " + " ".join(f"{v:>7.0f}" for v in line))
             gains = []
-            for threads in [1, 2, 4, 8, 16, 32]:
+            for threads in thread_levels:
                 one = median_by(seen, "mib_per_s", stripe_count=1, threads=threads)
                 widest = median_by(seen, "mib_per_s", stripe_count=-1, threads=threads)
                 gains.append(widest / one if one else float("nan"))
             log("   gain widest/1 stripe: " + " ".join(f"{g:>6.2f}x" for g in gains))
+            granted = " ".join(
+                f"{'all' if c < 0 else c}->{median_by(seen, 'osts_per_file', stripe_count=c):.0f}"
+                for c in stripe_levels)
+            log(f"   stripes requested->granted: {granted}")
 
 
 @experiment("write_path")
 def write_path():
     """Everything else measures reads. Checkpoints are writes."""
+    # Checkpoint writes are the case wide striping is meant for, so the shapes
+    # bracket it: many small files (one stripe each, whatever is requested) and
+    # one large file that spans the whole sweep.
     bytes_per_cell = 256 << 20
     for label, size_mib, count in [("many_small", 0.25, bytes_per_cell // (256 << 10)),
                                    ("one_large", 256.0, 1)]:
-        for stripe_count in [1, 4, -1]:
+        for stripe_count in [1, 4, 16, -1]:
             for repeat in range(REPEATS):
                 cell = f"write_path/{label}/{stripe_count}/{repeat}"
 
@@ -89,7 +105,9 @@ def write_path():
 
                 measured(cell, body)
         seen = rows(f"write_path/{label}/")
-        line = [f"{median_by(seen,'mib_per_s',stripe_count=c):.0f}" for c in [1, 4, -1]]
-        held = [f"{median_by(seen,'osts_per_file',stripe_count=c):.0f}" for c in [1, 4, -1]]
-        log(f"{label:>11} write MiB/s at 1/4/all stripes: "
-                   + " ".join(f"{v:>6}" for v in line) + "   OSTs held: " + "/".join(held))
+        levels = [1, 4, 16, -1]
+        line = [f"{median_by(seen,'mib_per_s',stripe_count=c):.0f}" for c in levels]
+        held = [f"{median_by(seen,'osts_per_file',stripe_count=c):.0f}" for c in levels]
+        log(f"{label:>11} write MiB/s at 1/4/16/all stripes: "
+            + " ".join(f"{v:>6}" for v in line)
+            + "   objects per file: " + "/".join(held))

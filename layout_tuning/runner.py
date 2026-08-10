@@ -98,6 +98,16 @@ def main(argv=None):
     configure(f"_rank{rank}" if multi else "")
     log(f"=== {' '.join(names)} | job {os.environ.get('SLURM_JOB_ID', 'local')} "
         f"| node {os.environ.get('SLURMD_NODENAME', 'local')} | rank {rank}/{nodes} ===")
+    try:
+        from .io import target_counts
+        mdts, osts = target_counts()
+        log(f"filesystem has {mdts} MDTs and {osts} OSTs")
+    except Exception as exc:
+        log(f"could not read target counts: {exc}")
+
+    if not read_counters():
+        log("note: /proc/fs/lustre counters are unreadable here, so rows carry "
+            "phase timings but no per-call attribution")
 
     for name in names:
         entry = _registry[name]
