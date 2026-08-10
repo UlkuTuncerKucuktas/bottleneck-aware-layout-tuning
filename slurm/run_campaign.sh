@@ -95,9 +95,20 @@ else
 fi
 
 # 32 cores where the sweep needs them, 16 otherwise.
-WIDE="$COMMON --cpus-per-task=32 $GRES_WIDE slurm/single.sbatch"
-NARROW="$COMMON $GRES_NARROW slurm/single.sbatch"
-MULTI="$COMMON $GRES_NARROW slurm/multi.sbatch"
+# Core counts are site-specific: a partition may demand multiples of 16, or of
+# 20, and reject anything else ("cekirdek sayisi 20 ve katlari olmalidir"). The
+# sweeps need "enough" cores rather than an exact number, so both are settable:
+#
+#   LAYOUT_CORES=20 LAYOUT_CORES_WIDE=40 ./slurm/run_campaign.sh
+#
+# Where a GPU ratio is also enforced, LAYOUT_GRES_WIDE has to match the wide
+# count -- one GPU per 16 or per 20 cores, depending on the site.
+CORES="${LAYOUT_CORES-16}"
+CORES_WIDE="${LAYOUT_CORES_WIDE-32}"
+
+WIDE="$COMMON --cpus-per-task=$CORES_WIDE $GRES_WIDE slurm/single.sbatch"
+NARROW="$COMMON --cpus-per-task=$CORES $GRES_NARROW slurm/single.sbatch"
+MULTI="$COMMON --cpus-per-task=$CORES $GRES_NARROW slurm/multi.sbatch"
 
 echo "jobid       experiment"
 submit "$WIDE"   stripe_grid

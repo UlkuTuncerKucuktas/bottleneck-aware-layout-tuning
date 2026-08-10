@@ -186,7 +186,13 @@ def cores_vs_throughput():
     # per-open layout overhead and the question here -- whether extra
     # parallelism needs cores to drive it -- could not be answered at all.
     file_size = 64 << 20
-    core_levels = [c for c in [1, 2, 4, 8, 16] if c <= allocated_cores()]
+    # Powers of two up to the allocation, plus the allocation itself when it is
+    # not one. A site that hands out cores in multiples of 20 would otherwise
+    # top out at 16 and never measure the case the job was actually given.
+    granted = allocated_cores()
+    core_levels = [c for c in [1, 2, 4, 8, 16, 32] if c <= granted]
+    if granted not in core_levels:
+        core_levels.append(granted)
     # Held constant across every cell so the swept axis is cores alone. 16 is
     # above the knee stripe_grid found, so concurrency is not itself the limit.
     fixed_threads = 16

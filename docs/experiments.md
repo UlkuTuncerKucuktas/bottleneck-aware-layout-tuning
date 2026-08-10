@@ -476,3 +476,33 @@ Submitting by hand needs the same flag:
 
 `run_campaign.sh` runs under `set -e`, so a rejected submit stops the chain
 rather than leaving a half-submitted campaign behind.
+
+## Core counts are site-specific too
+
+Partitions enforce their own core quantum, and reject anything else:
+
+    sbatch: error: barbun-cuda kuyruguna gonderilen islerin cekirdek sayisi
+                   20 ve katlari olmalidir
+
+kolyoz-cuda wants multiples of 16, barbun-cuda multiples of 20. The sweeps need
+"enough" cores rather than an exact number, so both counts are settable:
+
+    LAYOUT_CORES=20 LAYOUT_CORES_WIDE=40 ./slurm/run_campaign.sh
+
+Where a GPU ratio is also enforced, `LAYOUT_GRES_WIDE` has to match the wide
+count -- one GPU per 16 cores on kolyoz, and whatever barbun-cuda requires for
+40. If the ratio is rejected, the error names it.
+
+`cores_vs_throughput` sweeps powers of two up to the allocation and then the
+allocation itself, so a 20-core job measures 1/2/4/8/16/20 rather than stopping
+at 16 and never testing what it was actually given.
+
+## Site rules on TRUBA, collected
+
+Each of these appeared only as a submit rejection, never in advance:
+
+    kolyoz-cuda   jobs must request a GPU
+    kolyoz-cuda   cores must be a multiple of 16
+    kolyoz-cuda   one GPU per 16 cores
+    barbun-cuda   cores must be a multiple of 20
+    all           the job's working directory must be under /arf/scratch
