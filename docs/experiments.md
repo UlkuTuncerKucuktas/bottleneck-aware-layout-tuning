@@ -585,3 +585,16 @@ read -- a ratio near 0.06 -- while the broken configuration measured 332 against
 
 The OST arm is the control. If it is as fast as the DoM arm, nothing was
 evicted and no row in the table means anything.
+
+### Why there is a behavioural test for eviction
+
+The no-op `evict()` was shipped once while a duplicated definition later in
+`layout.py` shadowed it, so the suite kept reopening files and kept destroying
+DoM inlining. The edit's own check searched the source for a phrase from the new
+docstring, found it, and reported success -- the phrase was there, just not in
+the definition Python binds.
+
+`tests/failure_paths.py` therefore asserts on behaviour rather than text: it
+traps `os.open` and requires that `evict()` opens nothing, and separately
+refuses any duplicated top-level name in `layout.py`. Both were confirmed to
+fail against the broken version before being kept.
