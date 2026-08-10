@@ -1,8 +1,15 @@
 #!/bin/bash
 # Run a one-off diagnostic on a compute node:
 #
-#   sbatch --chdir=$LAYOUT_SCRATCH -p $LAYOUT_PARTITION -A $LAYOUT_ACCOUNT \
-#       slurm/probe.sbatch slurm/evict_probe.py
+#   source slurm/barbun.env
+#   ./slurm/submit_probe.sh slurm/evict_probe.py
+#
+# Use that wrapper rather than sbatch directly. The directives below are only a
+# default for the cluster this was written on: #SBATCH lines are comments the
+# scheduler parses before any shell runs, so they cannot read LAYOUT_CORES, and
+# a hardcoded core count is rejected by any partition with a different quantum
+# (16 on kolyoz-cuda, 20 on barbun-cuda). submit_probe.sh passes the geometry on
+# the command line, where it overrides these.
 #
 # The directive block below matters more than it looks. A partition that
 # enforces a GPU-per-core ratio computes it PER NODE, so it needs -N and

@@ -511,11 +511,17 @@ Each of these appeared only as a submit rejection, never in advance:
 The GPU ratio is enforced PER NODE, so the filter needs `-N` and `--ntasks` to
 work out what a job is asking for. An `sbatch --wrap` carrying only
 `--cpus-per-task` and `--gres` is rejected on a request that is arithmetically
-correct. One-off diagnostics therefore go through `slurm/probe.sbatch`, whose
-directive block has the same shape as the experiment scripts:
+correct. One-off diagnostics therefore go through `slurm/probe.sbatch`, whose directive
+block has the same shape as the experiment scripts, submitted via a wrapper that
+applies the site geometry:
 
-    sbatch --chdir=$LAYOUT_SCRATCH -p $LAYOUT_PARTITION -A $LAYOUT_ACCOUNT \
-        slurm/probe.sbatch slurm/evict_probe.py
+    source slurm/barbun.env
+    ./slurm/submit_probe.sh slurm/evict_probe.py
+
+The wrapper exists because `#SBATCH` lines are comments the scheduler parses
+before any shell runs, so they cannot read `LAYOUT_CORES` -- a header with a
+hardcoded core count is rejected by any partition with a different quantum. The
+geometry goes on the command line, where it overrides the header.
 
 ## Keep the site settings in a file, not in your shell
 
