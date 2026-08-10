@@ -52,7 +52,19 @@ whatever every other logged-in user is doing.
 
 ## Cluster notes (TRUBA)
 
-The `kolyoz-cuda` partition rejects jobs that request no GPU, and requires a
-core count that is a multiple of 16. The submit scripts request one GPU and 32
-cores; the GPU is idle, but it is the price of admission. Run everything on
-Lustre under `/arf/scratch`, never on node-local storage.
+The `kolyoz-cuda` partition has three submit-filter rules, each reported only
+as a rejection at submit time:
+
+- every job must request at least one GPU,
+- the core count must be a multiple of 16,
+- and there must be **one GPU per 16 cores**.
+
+So 16 cores go with `--gres=gpu:1` and 32 cores with `--gres=gpu:2`. The GPUs sit
+idle — these are I/O measurements — but they are the price of admission. The
+submit scripts default to 16 cores and one GPU, which is enough for every
+experiment except `stripe_grid`, whose thread sweep reaches 32:
+
+    sbatch --cpus-per-task=32 --gres=gpu:2 slurm/single.sbatch stripe_grid
+
+Run everything on Lustre under `/arf/scratch`, never on node-local storage, and
+never on a login node.

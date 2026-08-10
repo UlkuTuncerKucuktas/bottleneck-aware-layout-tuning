@@ -1,6 +1,6 @@
 """Layout definitions and the Lustre commands used to apply them."""
 
-import os, sys, array, fcntl, shutil, subprocess
+import os, sys, time, array, fcntl, shutil, subprocess
 
 # Override with LAYOUT_SCRATCH to run somewhere else.
 SCRATCH = os.environ.get("LAYOUT_SCRATCH",
@@ -45,12 +45,19 @@ def flush_dom_lock(fd):
 
 
 def evict(paths):
-    """Drop pages without opening the file for reading (that would take the lock)."""
+    """Drop pages without opening the file for reading (that would take the lock).
+
+    Cache eviction is what makes a read measurement mean anything, so a
+    platform without posix_fadvise fails here rather than silently returning
+    warm-cache numbers.
+    """
+    if not hasattr(os, "posix_fadvise"):
+        raise RuntimeError(
+            "os.posix_fadvise is unavailable, so the page cache cannot be dropped; "
+            "these measurements require Linux")
     for path in paths:
         fd = os.open(path, os.O_RDONLY)
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
         os.close(fd)
     run("sync")
     time.sleep(0.5)
-
-
