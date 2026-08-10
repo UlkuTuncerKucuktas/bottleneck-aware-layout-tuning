@@ -505,7 +505,17 @@ Each of these appeared only as a submit rejection, never in advance:
     kolyoz-cuda   cores must be a multiple of 16
     kolyoz-cuda   one GPU per 16 cores
     barbun-cuda   cores must be a multiple of 20
+    barbun-cuda   one GPU per 20 cores
     all           the job's working directory must be under /arf/scratch
+
+The GPU ratio is enforced PER NODE, so the filter needs `-N` and `--ntasks` to
+work out what a job is asking for. An `sbatch --wrap` carrying only
+`--cpus-per-task` and `--gres` is rejected on a request that is arithmetically
+correct. One-off diagnostics therefore go through `slurm/probe.sbatch`, whose
+directive block has the same shape as the experiment scripts:
+
+    sbatch --chdir=$LAYOUT_SCRATCH -p $LAYOUT_PARTITION -A $LAYOUT_ACCOUNT \
+        slurm/probe.sbatch slurm/evict_probe.py
 
 ## Keep the site settings in a file, not in your shell
 
@@ -546,3 +556,20 @@ show the contrast directly: 0.97x at 64 KiB when neither arm was evicted,
 open/read split for each. Inlining is unmistakable in that split -- an
 expensive open and a nearly free read -- so the probe settles which strategy
 works on a given cluster rather than leaving it to argument.
+
+### Reading the eviction probe
+
+`slurm/evict_probe.py` judges inlining by the ratio of read time to open time,
+not by which is larger. On a warm cache both are microseconds and their order is
+noise; the signature of a working DoM read is a read that is a small fraction of
+the open, because the payload arrived with the reply and the read is a memory
+copy. The validated run on this filesystem measured 668 us open against 39 us
+read -- a ratio near 0.06 -- while the broken configuration measured 332 against
+1656, a ratio of 5.
+
+    ratio < 0.25    inlined
+    ratio > 1.0     not inlined: the data came by a separate RPC
+    in between      neither, most likely a warm cache
+
+The OST arm is the control. If it is as fast as the DoM arm, nothing was
+evicted and no row in the table means anything.

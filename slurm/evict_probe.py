@@ -35,6 +35,8 @@ COUNT = 200
 
 
 def fadvise_evict(paths):
+    if not hasattr(os, "posix_fadvise"):
+        raise RuntimeError("posix_fadvise is Linux-only")
     for path in paths:
         fd = os.open(path, os.O_RDONLY)
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
@@ -47,7 +49,11 @@ def measure(layout, label, evictor):
     if evictor:
         evictor(paths)
     stats = profile_reads(paths)
-    return stats["open_us_p50"], stats["read_us_p50"], stats["total_us_p50"]
+    # first_read_us is the phase that distinguishes the cases: it is the read
+    # that either finds the data already in hand from the open reply or has to
+    # issue an RPC for it. rest_read_us covers the remaining chunks of a file
+    # larger than one buffer, which for these 64 KiB files is nothing.
+    return stats["open_us_p50"], stats["first_read_us_p50"], stats["total_us_p50"]
 
 
 def main():
@@ -61,13 +67,34 @@ def main():
         for ename, evictor in (("none", None),
                                ("flush", evict_by_flush),
                                ("fadvise", fadvise_evict)):
-            open_us, read_us, total_us = measure(layout, f"{lname}_{ename}", evictor)
+            # One strategy failing must not cost the rows already measured: the
+            # comparison is the point, and a partial table still shows it.
+            try:
+                open_us, read_us, total_us = measure(layout, f"{lname}_{ename}",
+                                                     evictor)
+            except (OSError, RuntimeError) as exc:
+                print(f"{lname:>5} {ename:>9} {'—':>9} {'—':>9} {'—':>9}   "
+                      f"unavailable: {exc}")
+                continue
             results[(lname, ename)] = (open_us, read_us, total_us)
             # Inlining shows as the open carrying the cost and the read being
             # nearly free. The ratio is what separates the cases; absolute
             # numbers move with load.
             if lname == "DoM":
-                verdict = "INLINED" if read_us < open_us else "not inlined"
+                # Inlining is not merely "read faster than open" -- on a warm
+                # cache both are microseconds and the ratio means nothing. The
+                # signature is a read that is a small FRACTION of the open,
+                # because the payload arrived with the reply and the read is a
+                # memory copy. The validated run on this filesystem showed
+                # 668 us open against 39 us read, a ratio near 0.06; the broken
+                # configuration showed 332 against 1656, a ratio of 5.
+                ratio = read_us / open_us if open_us else float("inf")
+                if ratio < 0.25:
+                    verdict = f"INLINED (read/open {ratio:.2f})"
+                elif ratio > 1.0:
+                    verdict = f"NOT inlined (read/open {ratio:.2f})"
+                else:
+                    verdict = f"unclear (read/open {ratio:.2f}), likely warm"
             else:
                 verdict = ""
             print(f"{lname:>5} {ename:>9} {open_us:>9.1f} {read_us:>9.1f} "
@@ -75,6 +102,9 @@ def main():
 
     print()
     for ename in ("none", "flush", "fadvise"):
+        if ("DoM", ename) not in results or ("OST", ename) not in results:
+            print(f"  {ename:>7}: incomplete, no comparison")
+            continue
         dom = results[("DoM", ename)][2]
         ost = results[("OST", ename)][2]
         print(f"  {ename:>7}: DoM is {ost / dom:.2f}x OST")
