@@ -2,8 +2,9 @@
 
 import os, time, shutil
 
-from ..layout import SCRATCH, OST_PLAIN, OST_WIDE, dom_layout, fresh_dir, evict
-from ..io import (write_files, read_many, read_ranges, ranged_reader, read_until,
+from ..layout import (SCRATCH, OST_PLAIN, OST_WIDE, dom_layout, fresh_dir,
+                       working_dir, evict)
+from ..io import (write_files, read_many, ranged_reader, read_until,
                   mdt_used_kib,
                   osts_per_file, stat_rate, burn_cpu, restricted_to_cores,
                   allocated_cores, pool_names, pool_members, inherited_pool,
@@ -44,33 +45,31 @@ def stripe_grid():
 
                         def body(pattern=pattern, size_mib=size_mib,
                                  stripe_count=stripe_count, threads=threads):
-                            directory = fresh_dir(
-                                f"{SCRATCH}/e4_{pattern}_{stripe_count}_{threads}_{size_mib}",
-                                f"-c {stripe_count} -S 1M")
-                            size_bytes = int(size_mib * (1 << 20))
-                            if pattern == "fpw":
-                                volume = cell_bytes[size_mib]
-                                paths, wstats = write_files(
-                                    directory, volume // size_bytes, size_bytes,
-                                    flush=False)
-                                elapsed, total, passes = read_until(
-                                    paths, threads, min_seconds)
-                            else:
-                                paths, wstats = write_files(directory, 1, bytes_per_cell,
-                                                            flush=False)
-                                elapsed, total, passes = read_until(
-                                    paths, threads, min_seconds,
-                                    reader=ranged_reader(paths[0], bytes_per_cell))
-                            row = {"pattern": pattern, "size_mib": size_mib,
-                                   "files_per_thread": len(paths) / threads,
-                                   "read_s": elapsed, "passes": passes,
-                                   "stripe_count": stripe_count, "threads": threads,
-                                   "files": len(paths), "read_s": elapsed,
-                                   "mib_per_s": total / elapsed / (1 << 20),
-                                   "osts_per_file": osts_per_file(paths[0]),
-                                   "write_mib_per_s": (len(paths) * size_bytes / (1 << 20)
-                                                       / wstats["write_wall_s"])}
-                            shutil.rmtree(directory, ignore_errors=True)
+                            with working_dir(f"{SCRATCH}/e4_{pattern}_{stripe_count}_{threads}_{size_mib}",
+                                f"-c {stripe_count} -S 1M") as directory:
+                                size_bytes = int(size_mib * (1 << 20))
+                                if pattern == "fpw":
+                                    volume = cell_bytes[size_mib]
+                                    paths, wstats = write_files(
+                                        directory, volume // size_bytes, size_bytes,
+                                        flush=False)
+                                    elapsed, total, passes = read_until(
+                                        paths, threads, min_seconds)
+                                else:
+                                    paths, wstats = write_files(directory, 1, bytes_per_cell,
+                                                                flush=False)
+                                    elapsed, total, passes = read_until(
+                                        paths, threads, min_seconds,
+                                        reader=ranged_reader(paths[0], bytes_per_cell))
+                                row = {"pattern": pattern, "size_mib": size_mib,
+                                       "files_per_thread": len(paths) / threads,
+                                       "read_s": elapsed, "passes": passes,
+                                       "stripe_count": stripe_count, "threads": threads,
+                                       "files": len(paths), "read_s": elapsed,
+                                       "mib_per_s": total / elapsed / (1 << 20),
+                                       "osts_per_file": osts_per_file(paths[0]),
+                                       "write_mib_per_s": (len(paths) * size_bytes / (1 << 20)
+                                                           / wstats["write_wall_s"])}
                             return row
 
                         measured(cell, body)
@@ -108,16 +107,15 @@ def write_path():
 
                 def body(label=label, size_mib=size_mib, count=count,
                          stripe_count=stripe_count):
-                    directory = fresh_dir(f"{SCRATCH}/e11_{label}_{stripe_count}",
-                                          f"-c {stripe_count} -S 1M")
-                    paths, wstats = write_files(directory, count,
-                                                int(size_mib * (1 << 20)),
-                                                flush=False, profile=True)
-                    row = {"shape": label, "stripe_count": stripe_count,
-                           "files": len(paths),
-                           "mib_per_s": count * size_mib / wstats["write_wall_s"],
-                           "osts_per_file": osts_per_file(paths[0]), **wstats}
-                    shutil.rmtree(directory, ignore_errors=True)
+                    with working_dir(f"{SCRATCH}/e11_{label}_{stripe_count}",
+                                          f"-c {stripe_count} -S 1M") as directory:
+                        paths, wstats = write_files(directory, count,
+                                                    int(size_mib * (1 << 20)),
+                                                    flush=False, profile=True)
+                        row = {"shape": label, "stripe_count": stripe_count,
+                               "files": len(paths),
+                               "mib_per_s": count * size_mib / wstats["write_wall_s"],
+                               "osts_per_file": osts_per_file(paths[0]), **wstats}
                     return row
 
                 measured(cell, body)
@@ -155,18 +153,17 @@ def cores_vs_throughput():
                 cell = f"cores_vs_throughput/{stripe_count}/{cores}/{repeat}"
 
                 def body(stripe_count=stripe_count, cores=cores):
-                    directory = fresh_dir(f"{SCRATCH}/cores_{stripe_count}_{cores}",
-                                          f"-c {stripe_count} -S 1M")
-                    paths, _ = write_files(directory, bytes_per_cell // file_size,
-                                           file_size, flush=False)
-                    with restricted_to_cores(cores):
-                        elapsed, total, passes = read_until(paths, cores * 2, min_seconds)
-                    row = {"stripe_count": stripe_count, "cores": cores,
-                           "threads": cores * 2, "files": len(paths),
-                           "read_s": elapsed, "passes": passes,
-                           "mib_per_s": total / elapsed / (1 << 20),
-                           "osts_per_file": osts_per_file(paths[0])}
-                    shutil.rmtree(directory, ignore_errors=True)
+                    with working_dir(f"{SCRATCH}/cores_{stripe_count}_{cores}",
+                                          f"-c {stripe_count} -S 1M") as directory:
+                        paths, _ = write_files(directory, bytes_per_cell // file_size,
+                                               file_size, flush=False)
+                        with restricted_to_cores(cores):
+                            elapsed, total, passes = read_until(paths, cores * 2, min_seconds)
+                        row = {"stripe_count": stripe_count, "cores": cores,
+                               "threads": cores * 2, "files": len(paths),
+                               "read_s": elapsed, "passes": passes,
+                               "mib_per_s": total / elapsed / (1 << 20),
+                               "osts_per_file": osts_per_file(paths[0])}
                     return row
 
                 measured(cell, body)
@@ -229,18 +226,17 @@ def pool_selection():
                 cell = f"pool_selection/{pool}/{stripe_count}/{repeat}"
 
                 def body(pool=pool, pool_flag=pool_flag, stripe_count=stripe_count):
-                    directory = fresh_dir(f"{SCRATCH}/pool_{pool}_{stripe_count}",
-                                          f"-c {stripe_count} -S 1M {pool_flag}")
-                    paths, wstats = write_files(directory, count, file_size, flush=False)
-                    elapsed, total, passes = read_until(paths, 8, min_seconds)
-                    row = {"pool": pool, "stripe_count": stripe_count,
-                           "files": len(paths), "read_s": elapsed, "passes": passes,
-                           "read_mib_per_s": total / elapsed / (1 << 20),
-                           "write_mib_per_s": (count * file_size / (1 << 20)
-                                               / wstats["write_wall_s"]),
-                           "osts_per_file": osts_per_file(paths[0]),
-                           "granted_pool": inherited_pool(paths[0])}
-                    shutil.rmtree(directory, ignore_errors=True)
+                    with working_dir(f"{SCRATCH}/pool_{pool}_{stripe_count}",
+                                          f"-c {stripe_count} -S 1M {pool_flag}") as directory:
+                        paths, wstats = write_files(directory, count, file_size, flush=False)
+                        elapsed, total, passes = read_until(paths, 8, min_seconds)
+                        row = {"pool": pool, "stripe_count": stripe_count,
+                               "files": len(paths), "read_s": elapsed, "passes": passes,
+                               "read_mib_per_s": total / elapsed / (1 << 20),
+                               "write_mib_per_s": (count * file_size / (1 << 20)
+                                                   / wstats["write_wall_s"]),
+                               "osts_per_file": osts_per_file(paths[0]),
+                               "granted_pool": inherited_pool(paths[0])}
                     return row
 
                 measured(cell, body)

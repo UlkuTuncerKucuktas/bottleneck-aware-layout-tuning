@@ -26,8 +26,10 @@ def write_files(directory, count, size_bytes, flush=True, profile=False):
         written = 0
         while written < size_bytes:
             n = min(CHUNK, size_bytes - written)
-            os.write(fd, payload[:n])
-            written += n
+            # os.write may accept fewer bytes than offered; counting the request
+            # rather than the result would leave files short of size_bytes and
+            # quietly change what is being measured.
+            written += os.write(fd, payload[:n])
         t2 = time.perf_counter()
         if flush:
             flush_dom_lock(fd)
@@ -76,7 +78,9 @@ def prewarm(pool, threads):
     barrier = threading.Barrier(threads + 1)
     for _ in range(threads):
         pool.submit(barrier.wait)
-    barrier.wait()
+    # A timeout rather than an unbounded wait: a pool that cannot start every
+    # worker should fail the cell, not hold the allocation until the wall clock.
+    barrier.wait(timeout=60)
 
 
 def read_many(paths, threads, pool=None):
@@ -120,35 +124,6 @@ def read_until(paths, threads, min_seconds, reader=None):
             total_bytes += got
             passes += 1
     return elapsed, total_bytes, passes
-
-
-def read_ranges(path, size_bytes, threads):
-    """All threads read disjoint ranges of one file (the checkpoint shape)."""
-    fd = os.open(path, os.O_RDONLY)
-    span = size_bytes // threads
-    bounds = [(k * span, size_bytes if k == threads - 1 else (k + 1) * span)
-              for k in range(threads)]
-
-    def worker(bound):
-        start, end = bound
-        got, offset = 0, start
-        while offset < end:
-            chunk = os.pread(fd, min(CHUNK, end - offset), offset)
-            if not chunk:
-                break
-            offset += len(chunk)
-            got += len(chunk)
-        return got
-
-    try:
-        with ThreadPoolExecutor(max_workers=threads) as pool:
-            prewarm(pool, threads)
-            started = time.perf_counter()
-            total = sum(pool.map(worker, bounds))
-            elapsed = time.perf_counter() - started
-    finally:
-        os.close(fd)
-    return elapsed, total
 
 
 def ranged_reader(path, size_bytes):
@@ -223,6 +198,10 @@ def osts_per_file(path):
     """
     counts = [int(token) for token in capture(f"lfs getstripe -c {path}").split()
               if token.lstrip("-").isdigit()]
+    # A component can report -1 ("all available") when queried on a directory
+    # rather than a file. Counting that as a width would make footprint figures
+    # negative, so only real object counts are considered.
+    counts = [c for c in counts if c > 0]
     return max(counts) if counts else 0
 
 

@@ -2,7 +2,8 @@
 
 import os, time, shutil
 
-from ..layout import SCRATCH, OST_PLAIN, OST_WIDE, dom_layout, fresh_dir, evict
+from ..layout import (SCRATCH, OST_PLAIN, OST_WIDE, dom_layout, fresh_dir,
+                       working_dir, evict)
 from ..io import write_files, read_many, read_until, osts_per_file
 from ..probes import profile_reads
 from ..runner import experiment, measured, median_by, rows, log
@@ -40,14 +41,13 @@ def mds_scaling(rank, nodes):
         cell = f"mds_scaling/{nodes}/{arm}/{rank}"
 
         def body(arm=arm, layout=layout):
-            directory = fresh_dir(f"{SCRATCH}/mds_{arm}_{nodes}_{rank}", layout)
-            paths, _ = write_files(directory, 6000, 32 << 10)
-            evict(paths)
-            _rendezvous(arm, rank, nodes)
-            row = {"arm": arm, "clients": nodes, "rank": rank,
-                   "files": len(paths), **profile_reads(paths)}
-            row["files_per_s"] = 1e6 / row["total_us_mean"]
-            shutil.rmtree(directory, ignore_errors=True)
+            with working_dir(f"{SCRATCH}/mds_{arm}_{nodes}_{rank}", layout) as directory:
+                paths, _ = write_files(directory, 6000, 32 << 10)
+                evict(paths)
+                _rendezvous(arm, rank, nodes)
+                row = {"arm": arm, "clients": nodes, "rank": rank,
+                       "files": len(paths), **profile_reads(paths)}
+                row["files_per_s"] = 1e6 / row["total_us_mean"]
             return row
 
         measured(cell, body)
@@ -74,18 +74,17 @@ def neighbour_cost(rank, nodes):
 
         def body(label=label, neighbour_layout=neighbour_layout):
             layout = OST_PLAIN if rank == 0 else neighbour_layout
-            directory = fresh_dir(f"{SCRATCH}/neigh_{label}_{nodes}_{rank}", layout)
-            paths, _ = write_files(directory, file_count, file_size, flush=False)
-            evict(paths)
-            _rendezvous(label, rank, nodes)
-            elapsed, total, passes = read_until(paths, 8, min_seconds)
-            row = {"neighbour_layout": label, "rank": rank, "files": len(paths),
-                   "role": "victim" if rank == 0 else "neighbour",
-                   "read_s": elapsed, "passes": passes,
-                   "mib_per_s": total / elapsed / (1 << 20),
-                   "osts_per_file": osts_per_file(paths[0]),
-                   "ost_objects": len(paths) * osts_per_file(paths[0])}
-            shutil.rmtree(directory, ignore_errors=True)
+            with working_dir(f"{SCRATCH}/neigh_{label}_{nodes}_{rank}", layout) as directory:
+                paths, _ = write_files(directory, file_count, file_size, flush=False)
+                evict(paths)
+                _rendezvous(label, rank, nodes)
+                elapsed, total, passes = read_until(paths, 8, min_seconds)
+                row = {"neighbour_layout": label, "rank": rank, "files": len(paths),
+                       "role": "victim" if rank == 0 else "neighbour",
+                       "read_s": elapsed, "passes": passes,
+                       "mib_per_s": total / elapsed / (1 << 20),
+                       "osts_per_file": osts_per_file(paths[0]),
+                       "ost_objects": len(paths) * osts_per_file(paths[0])}
             return row
 
         measured(cell, body)

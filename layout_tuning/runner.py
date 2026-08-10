@@ -4,7 +4,7 @@ Each experiment is a function registered by name. A cell is one measured
 configuration; finished cells are recorded so an interrupted run resumes.
 """
 
-import os, sys, time, statistics
+import os, sys, time, statistics, traceback
 
 from .ledger import Ledger
 from .probes import read_counters, counter_delta, lock_unused_count
@@ -47,6 +47,12 @@ def measured(cell, body):
 
     `body` returns the row of measurements. The counter delta around it says
     which client operations the time went into.
+
+    A cell that raises is recorded as failed and the run continues. One bad
+    configuration should not cost the other hundred cells in the job, and a
+    recorded failure is not retried on resume unless the row is deleted -- so a
+    systematic failure does not loop, while a transient one can be redone by
+    removing its line from the ledger.
     """
     book = ledger()
     if book.done(cell):
@@ -55,7 +61,14 @@ def measured(cell, body):
     started = time.perf_counter()
     before = read_counters()
     locks_before = lock_unused_count()
-    row = body()
+    try:
+        row = body()
+    except Exception as exc:
+        elapsed = time.perf_counter() - started
+        book.append(cell, {"failed": True, "error": f"{type(exc).__name__}: {exc}",
+                           "cell_wall_s": elapsed})
+        book.log(f"FAILED {cell} after {elapsed:.1f}s: {type(exc).__name__}: {exc}")
+        return
     row.update(counter_delta(before, read_counters(), per=row.get("files", 1)))
     row["lock_unused_delta"] = lock_unused_count() - locks_before
     row["cell_wall_s"] = time.perf_counter() - started
@@ -64,12 +77,46 @@ def measured(cell, body):
 
 
 def median_by(rows, key, **match):
-    values = [r[key] for r in rows if key in r and all(r.get(k) == v for k, v in match.items())]
+    """Median of `key` over rows matching every keyword, ignoring failed cells.
+
+    A failed cell carries no measurements, so including it would either raise or
+    silently shift a median depending on the key.
+    """
+    values = [r[key] for r in rows
+              if not r.get("failed") and key in r
+              and all(r.get(k) == v for k, v in match.items())]
     return statistics.median(values) if values else float("nan")
 
 
 def rows(prefix):
     return ledger().rows(prefix)
+
+
+def _preflight():
+    """Fail in seconds rather than hours if the environment cannot measure.
+
+    Every check here corresponds to something that produced wrong numbers or a
+    late crash in an earlier run: a layout that cannot be applied, a cache that
+    cannot be dropped, a DoM flush the kernel rejects.
+    """
+    import shutil as _shutil
+
+    from .layout import SCRATCH, OST_PLAIN, dom_layout, working_dir, evict
+    from .io import write_files, osts_per_file
+
+    if _shutil.which("lfs") is None:
+        log("preflight skipped: no lfs on PATH, so this is not a Lustre client")
+        return
+
+    with working_dir(f"{SCRATCH}/preflight", OST_PLAIN) as directory:
+        paths, _ = write_files(directory, 2, 1 << 20, flush=False)
+        width = osts_per_file(paths[0])
+        assert width >= 1, f"lfs getstripe reported {width} objects for a plain file"
+        evict(paths)
+
+    with working_dir(f"{SCRATCH}/preflight_dom", dom_layout()) as directory:
+        paths, _ = write_files(directory, 2, 8 << 10, flush=True)
+        log(f"preflight ok: plain file on {width} OST(s), DoM layout applied and flushed")
 
 
 def main(argv=None):
@@ -118,12 +165,30 @@ def main(argv=None):
         log("note: /proc/fs/lustre counters are unreadable here, so rows carry "
             "phase timings but no per-call attribution")
 
+    _preflight()
+
+    failures = []
     for name in names:
         entry = _registry[name]
         log(f"===== {name} =====")
         started = time.perf_counter()
-        entry["fn"](rank=rank, nodes=nodes) if entry["nodes"] > 1 else entry["fn"]()
+        try:
+            entry["fn"](rank=rank, nodes=nodes) if entry["nodes"] > 1 else entry["fn"]()
+        except Exception as exc:
+            # Summary code outside a cell can fail on its own; the cells it was
+            # summarising are already in the ledger, and the next experiment in
+            # this job is independent of this one.
+            failures.append(name)
+            log(f"!!!!! {name} aborted: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
         log(f"----- {name} took {(time.perf_counter() - started) / 60:.1f} min")
 
+    failed_cells = sum(1 for r in ledger().rows("") if r.get("failed"))
+    if failed_cells:
+        log(f"{failed_cells} cell(s) recorded as failed; "
+            "grep FAILED in the log, or 'failed' in the ledger")
+    if failures:
+        log(f"experiments that aborted: {', '.join(failures)}")
+        return 1
     log("all requested work complete")
     return 0

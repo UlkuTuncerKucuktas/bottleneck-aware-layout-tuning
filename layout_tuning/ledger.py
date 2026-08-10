@@ -42,6 +42,13 @@ class Ledger:
             f.flush()
 
     def rows(self, prefix):
+        """Rows whose cell key starts with `prefix`.
+
+        An absent file means no cell has finished yet, which is a normal state
+        early in a run rather than an error.
+        """
+        if not os.path.exists(self.path):
+            return []
         out = []
         for line in open(self.path):
             row = json.loads(line)

@@ -14,7 +14,14 @@ import json
 import pandas as pd
 
 
-def load(pattern="results*.jsonl"):
+def load(pattern="results*.jsonl", include_failed=False):
+    """Every row from every matching ledger, failed cells excluded by default.
+
+    A cell that raised is recorded with failed=True and no measurements, so
+    letting those rows into a groupby would put NaNs beside real values. They
+    are dropped here and their count reported, because a silent drop and a
+    silent inclusion are both worse than a number on stderr.
+    """
     rows = []
     for path in sorted(glob.glob(pattern)):
         for line in open(path):
@@ -26,7 +33,16 @@ def load(pattern="results*.jsonl"):
             rows.append(row)
     if not rows:
         raise FileNotFoundError(f"no ledger matched {pattern}")
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    if "failed" in frame.columns:
+        failed = frame["failed"].fillna(False).astype(bool)
+        if failed.any():
+            print(f"note: {int(failed.sum())} failed cell(s) in {pattern}"
+                  f"{'' if include_failed else ', excluded'}; "
+                  "see the error column for why")
+        if not include_failed:
+            frame = frame[~failed].drop(columns=["failed", "error"], errors="ignore")
+    return frame.reset_index(drop=True)
 
 
 def phase_breakdown(df, experiment, group):

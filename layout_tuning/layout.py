@@ -38,6 +38,30 @@ def fresh_dir(path, layout):
     return path
 
 
+class working_dir:
+    """A layout-stamped directory that is removed even if the cell fails.
+
+    Every cell writes GiB of files, and a cell that raises used to leave them
+    behind: over a long run that fills the filesystem and, worse, leaves a
+    directory whose layout a later cell might inherit. As a context manager the
+    cleanup happens on the way out either way.
+
+        with working_dir(f"{SCRATCH}/thing", OST_PLAIN) as directory:
+            ...
+    """
+
+    def __init__(self, path, layout):
+        self.path = path
+        self.layout = layout
+
+    def __enter__(self):
+        return fresh_dir(self.path, self.layout)
+
+    def __exit__(self, *exc):
+        shutil.rmtree(self.path, ignore_errors=True)
+        return False
+
+
 def flush_dom_lock(fd):
     buf = array.array('B', bytes(16))
     buf[12:16] = array.array('B', LL_DV_WR_FLUSH.to_bytes(4, sys.byteorder))

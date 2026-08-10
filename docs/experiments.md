@@ -118,8 +118,16 @@ Lower it with LAYOUT_REPEATS=1 for a first look.
 
 ## Running the whole campaign
 
+    ./slurm/reset.sh --dry-run           # what a fresh start would archive
+    ./slurm/reset.sh                     # archive the ledger, clear debris
     ./slurm/run_campaign.sh --dry-run    # see the sbatch calls
     ./slurm/run_campaign.sh              # submit the chain, then walk away
+
+Nothing in the chain should be pulled out and run alongside it. Every experiment
+reads and writes the same 24 flash OSTs, and that includes the ones that look
+cheap: `write_path` and `pool_selection` move GiB at a time, and `tail_latency`
+reports p95 and p99, which is the metric a concurrent neighbour distorts first.
+`neighbour_cost` is the sole exception, and it creates its own interference.
 
 Each job carries `--dependency=afterany` on the one before it, so they run one
 at a time and the script returns as soon as everything is queued. `afterany`
@@ -138,3 +146,24 @@ ranks read while others are still writing. That produces a plausible-looking
 number with none of the concurrency the experiment exists to create, which is
 worse than a crash. The barrier also gives up after ten minutes rather than
 holding the allocation until the wall clock ends.
+
+## What happens when a cell fails
+
+A cell that raises is recorded with `failed: true` and its error, and the run
+continues to the next one -- a twelve-hour job should not be lost to one bad
+configuration. Recorded failures are not retried on resume, so a systematic
+failure cannot loop; to redo one, delete its line from the ledger. An experiment
+that aborts outside a cell (in its summary code, say) also lets the ones after it
+run, and the job exits non-zero so a failure is visible without reading logs.
+
+`analysis.load` drops failed rows by default and prints how many it dropped;
+pass `include_failed=True` to inspect them. The in-log medians skip them too.
+
+Working directories clean themselves up through `working_dir`, so a failed cell
+does not leave GiB behind or, worse, a directory whose layout a later cell might
+inherit.
+
+Before any measurement, `_preflight` writes a plain file and a DoM file, reads
+back the granted stripe width, drops the cache and flushes a DoM lock. Each check
+corresponds to something that has produced wrong numbers or a late crash here, so
+a broken environment fails in seconds rather than hours.

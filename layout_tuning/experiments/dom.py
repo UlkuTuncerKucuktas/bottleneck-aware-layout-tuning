@@ -2,8 +2,9 @@
 
 import os, time, shutil
 
-from ..layout import SCRATCH, OST_PLAIN, OST_WIDE, dom_layout, fresh_dir, evict
-from ..io import (write_files, read_many, read_ranges, mdt_used_kib,
+from ..layout import (SCRATCH, OST_PLAIN, OST_WIDE, dom_layout, fresh_dir,
+                       working_dir, evict)
+from ..io import (write_files, read_many, mdt_used_kib,
                   osts_per_file, stat_rate, burn_cpu)
 from ..probes import profile_reads
 from ..runner import experiment, measured, median_by, rows, log, REPEATS
@@ -19,13 +20,12 @@ def dom_cutoff():
                 cell = f"dom_cutoff/{component}/{size_kib}/{repeat}"
 
                 def body(component=component, size_kib=size_kib):
-                    directory = fresh_dir(f"{SCRATCH}/e1_{component}_{size_kib}",
-                                          dom_layout(component))
-                    paths, wstats = write_files(directory, 300, size_kib << 10, profile=True)
-                    evict(paths)
-                    row = {"component": component, "size_kib": size_kib,
-                           "files": len(paths), **wstats, **profile_reads(paths)}
-                    shutil.rmtree(directory, ignore_errors=True)
+                    with working_dir(f"{SCRATCH}/e1_{component}_{size_kib}",
+                                          dom_layout(component)) as directory:
+                        paths, wstats = write_files(directory, 300, size_kib << 10, profile=True)
+                        evict(paths)
+                        row = {"component": component, "size_kib": size_kib,
+                               "files": len(paths), **wstats, **profile_reads(paths)}
                     return row
 
                 measured(cell, body)
@@ -43,17 +43,16 @@ def dom_footprint():
             cell = f"dom_footprint/{arm}/{size_kib}"
 
             def body(arm=arm, layout=layout, size_kib=size_kib):
-                directory = fresh_dir(f"{SCRATCH}/e2_{arm}_{size_kib}", layout)
-                before = mdt_used_kib()
-                paths, wstats = write_files(directory, 20_000, size_kib << 10, profile=True)
-                after = mdt_used_kib()
-                evict(paths)
-                row = {"arm": arm, "size_kib": size_kib, "files": len(paths),
-                       "mdt_kib_per_file": (after - before) / len(paths),
-                       "mdt_kib_total": after - before,
-                       "stats_per_s": stat_rate(paths),
-                       "osts_per_file": osts_per_file(paths[0]), **wstats}
-                shutil.rmtree(directory, ignore_errors=True)
+                with working_dir(f"{SCRATCH}/e2_{arm}_{size_kib}", layout) as directory:
+                    before = mdt_used_kib()
+                    paths, wstats = write_files(directory, 20_000, size_kib << 10, profile=True)
+                    after = mdt_used_kib()
+                    evict(paths)
+                    row = {"arm": arm, "size_kib": size_kib, "files": len(paths),
+                           "mdt_kib_per_file": (after - before) / len(paths),
+                           "mdt_kib_total": after - before,
+                           "stats_per_s": stat_rate(paths),
+                           "osts_per_file": osts_per_file(paths[0]), **wstats}
                 return row
 
             measured(cell, body)
@@ -74,13 +73,12 @@ def flush_cost():
             cell = f"flush_cost/{arm}/{size_kib}"
 
             def body(arm=arm, layout=layout, flush=flush, size_kib=size_kib):
-                directory = fresh_dir(f"{SCRATCH}/e7_{arm}_{size_kib}", layout)
-                paths, wstats = write_files(directory, 4000, size_kib << 10,
-                                            flush=flush, profile=True)
-                evict(paths)
-                row = {"arm": arm, "size_kib": size_kib, "files": len(paths),
-                       **wstats, **profile_reads(paths)}
-                shutil.rmtree(directory, ignore_errors=True)
+                with working_dir(f"{SCRATCH}/e7_{arm}_{size_kib}", layout) as directory:
+                    paths, wstats = write_files(directory, 4000, size_kib << 10,
+                                                flush=flush, profile=True)
+                    evict(paths)
+                    row = {"arm": arm, "size_kib": size_kib, "files": len(paths),
+                           **wstats, **profile_reads(paths)}
                 return row
 
             measured(cell, body)
@@ -103,12 +101,11 @@ def tail_latency():
             cell = f"tail_latency/{arm}/{size_kib}"
 
             def body(arm=arm, layout=layout, size_kib=size_kib):
-                directory = fresh_dir(f"{SCRATCH}/e8_{arm}_{size_kib}", layout)
-                paths, _ = write_files(directory, 4000, size_kib << 10)
-                evict(paths)
-                row = {"arm": arm, "size_kib": size_kib, "files": len(paths),
-                       **profile_reads(paths)}
-                shutil.rmtree(directory, ignore_errors=True)
+                with working_dir(f"{SCRATCH}/e8_{arm}_{size_kib}", layout) as directory:
+                    paths, _ = write_files(directory, 4000, size_kib << 10)
+                    evict(paths)
+                    row = {"arm": arm, "size_kib": size_kib, "files": len(paths),
+                           **profile_reads(paths)}
                 return row
 
             measured(cell, body)
@@ -144,6 +141,9 @@ def repeated_epochs():
                         "read_s": elapsed, "files_per_s": len(paths) / elapsed}
 
             measured(cell, body)
+        # Files deliberately survive between epochs -- re-reading the same set is
+        # the measurement -- so cleanup waits for the last one and runs even if
+        # an epoch failed.
         shutil.rmtree(f"{SCRATCH}/e9_{arm}", ignore_errors=True)
     seen = rows("repeated_epochs/")
     for arm in ["ost", "dom"]:
