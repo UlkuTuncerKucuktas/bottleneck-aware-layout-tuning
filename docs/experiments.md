@@ -451,3 +451,28 @@ and reports p50, so a handful of un-inlined leading reads cannot move the
 headline number; it would visibly shift a mean, which is one more reason the
 suite reports percentiles. Anything reading a much smaller set should treat its
 first few files as warmup rather than measurement.
+
+## Jobs must run under the scratch filesystem
+
+Some sites reject a job whose working directory is outside scratch:
+
+    sbatch: error: Lutfen islerinizi /arf/scratch/ dizini altinda calistiriniz!
+    sbatch: error: Batch job submission failed: Job violates accounting/QOS policy
+
+The workdir defaults to wherever `sbatch` was invoked, and this repository
+normally lives in $HOME. `run_campaign.sh` therefore passes
+`--chdir=$LAYOUT_SCRATCH`, which is under /arf/scratch by construction.
+
+Two consequences. `SLURM_SUBMIT_DIR` still points at the repository -- `--chdir`
+does not change it -- so the scripts continue to find the module tree they copy.
+And `--output` is relative to the workdir, so **logs now land in
+`$LAYOUT_SCRATCH/logs/`**, not beside the repository. The script prints the path
+when it submits.
+
+Submitting by hand needs the same flag:
+
+    sbatch --chdir=$LAYOUT_SCRATCH -p <partition> -A <account> \
+        slurm/single.sbatch <experiment>
+
+`run_campaign.sh` runs under `set -e`, so a rejected submit stops the chain
+rather than leaving a half-submitted campaign behind.

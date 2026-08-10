@@ -66,9 +66,20 @@ submit() {
 # LAYOUT_GRES set but EMPTY means "request no GPU", which is what a CPU
 # partition needs; leaving it unset keeps the GPU request the cuda partitions
 # demand. No experiment here uses a GPU either way.
-COMMON=""
+# Some sites refuse jobs whose working directory is outside the scratch
+# filesystem ("Lutfen islerinizi /arf/scratch/ dizini altinda calistiriniz").
+# The job's workdir is the submit directory unless --chdir says otherwise, and
+# this repository normally lives in $HOME -- so point the workdir at the scratch
+# run directory, which is under /arf/scratch by construction. SLURM_SUBMIT_DIR
+# still refers to where sbatch was invoked, so the scripts continue to find the
+# module tree they copy from.
+COMMON="--chdir=$SCRATCH"
 [ -n "${LAYOUT_PARTITION-}" ] && COMMON="$COMMON -p $LAYOUT_PARTITION"
 [ -n "${LAYOUT_ACCOUNT-}" ]   && COMMON="$COMMON -A $LAYOUT_ACCOUNT"
+
+# --output is relative to the workdir and Slurm opens it before the job runs,
+# so the directory has to exist at submit time.
+[ -z "$DRY" ] && mkdir -p "$SCRATCH/logs"
 
 if [ "${LAYOUT_GRES-gpu:1}" = "" ]; then
     # --gres=NONE, not an omitted flag. The sbatch scripts carry their own
@@ -107,4 +118,4 @@ submit "-N 8 $MULTI" mds_scaling
 
 echo
 echo "chain submitted. watch with:  squeue -u \$USER"
-echo "logs appear in logs/ as each job starts"
+echo "logs:  $SCRATCH/logs/"
