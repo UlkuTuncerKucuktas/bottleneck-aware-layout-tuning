@@ -1,0 +1,11 @@
+[project]
+name = "layout-tuning"
+version = "0.1.0"
+description = "Bottleneck-aware, resource-minimal Lustre layout tuning: measurement suite"
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+analysis = ["pandas"]
+
+[tool.setuptools.packages.find]
+include = ["layout_tuning*"]
