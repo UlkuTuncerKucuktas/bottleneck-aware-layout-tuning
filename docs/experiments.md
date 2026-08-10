@@ -422,3 +422,32 @@ foregrounds, and the only one a user can set -- would place files there believin
 they get the full benefit. `dom_cutoff` brackets both: its sizes span the reply-buffer cliff,
 its components span the storage boundary, and every DoM row records the granted
 component so the two can be separated afterwards.
+
+### Reading the boundaries on a client
+
+The storage boundary lives on the server (`lod.*.dom_stripesize`) and is not
+readable from a client. Read it indirectly: create a DoM file and check what
+`lfs getstripe` reports for the first component's `lcme_extent.e_end`. A value
+below what `-E` asked for means the MDT truncated the request.
+
+The client-side parameter is `mdc.*.mdc_dom_min_repsize` -- the `mdc_` prefix is
+part of the leaf name, so a glob on `mdc.*.dom_min_repsize` finds nothing even
+where the parameter exists. It is the minimum reply size the client requests,
+not the ceiling on inlined data, so it does not by itself give the latency
+boundary. That boundary is where the payload stops fitting the open reply
+buffer, and nothing exposes it directly -- `dom_cutoff` finds it by measurement,
+which is the only way to see it.
+
+### The client grows its reply buffer, so early reads may differ
+
+Measured on /arf: `mdc.*.mdc_dom_min_repsize` is 8192 on every MDT, while the
+read cliff sits near 112-128 KiB. Those are consistent only because the value is
+a floor, not a ceiling -- the client asks for at least 8 KiB and enlarges the
+request as it observes the sizes actually being read.
+
+That makes the first reads after a fresh mount or a new size potentially
+un-inlined while later ones are inlined. `dom_cutoff` reads 300 files per cell
+and reports p50, so a handful of un-inlined leading reads cannot move the
+headline number; it would visibly shift a mean, which is one more reason the
+suite reports percentiles. Anything reading a much smaller set should treat its
+first few files as warmup rather than measurement.

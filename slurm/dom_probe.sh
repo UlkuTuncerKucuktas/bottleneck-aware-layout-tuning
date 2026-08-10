@@ -29,9 +29,13 @@ echo "=== 1b. the LATENCY boundary: how much arrives with the open ==="
 # that the file is still on the MDT but needs a second RPC to read. The limit
 # is reply-buffer space, NOT the component size -- which is why a component
 # granted at 1 MiB can still show a read cliff around 100-130 KiB.
-lctl get_param -n mdc.*.dom_min_repsize 2>/dev/null \
-    || echo "  (dom_min_repsize not exposed on this client)"
-lctl list_param mdc.*.* 2>/dev/null | grep -i dom || true
+# The leaf is mdc_dom_min_repsize, not dom_min_repsize: the mdc_ prefix is part
+# of the parameter name, not just the namespace.
+lctl get_param -n mdc.*.mdc_dom_min_repsize 2>/dev/null \
+    || lctl get_param -n mdc.*.dom_min_repsize 2>/dev/null \
+    || echo "  (no dom repsize parameter on this client)"
+echo "-- (this is the MINIMUM reply size the client asks for, not the ceiling;"
+echo "    the cliff is where the payload stops fitting the reply buffer)"
 
 echo
 echo "=== 2. what a file actually gets ==="
@@ -45,10 +49,19 @@ lfs getstripe "$DIR/f" | grep -E 'lcme_id|lcme_extent|pattern|stripe_count' | he
 
 echo
 echo "=== 3. does the file have OST objects? ==="
-# A properly inlined DoM file has NO object on any OST for its first component.
-# If objects appear covering byte 0, the data went to an OST and DoM did nothing.
-lfs getstripe "$DIR/f" | grep -E 'l_ost_idx|obdidx|objid' | head -5 \
-    || echo "  no OST objects listed -- consistent with data on the MDT"
+# A DoM file's first component holds its data on the MDT, so no OST object
+# should exist for it. The second component is declared but uninstantiated
+# until the file grows past the boundary, and an uninstantiated component has
+# no objects either -- so an empty result here is the expected, correct answer.
+# Capture first: a pipeline's status is the LAST command's, and `head` exits 0
+# on empty input, so `grep ... | head || echo` never reaches the fallback.
+objects=$(lfs getstripe "$DIR/f" | grep -E 'l_ost_idx|obdidx|objid' | head -5)
+if [ -n "$objects" ]; then
+    echo "$objects"
+    echo "  ^ the file HAS OST objects, so its data did not stay on the MDT"
+else
+    echo "  no OST objects: the data is on the MDT, which is what DoM should do"
+fi
 
 echo
 echo "=== 4. is the component the size we asked for? ==="
@@ -56,5 +69,11 @@ lfs getstripe "$DIR/f" | awk '/lcme_extent.e_end/ {print "  component ends at", 
 
 rm -rf "$DIR"
 echo
-echo "Read line 4 against the 1048576 bytes requested. If it is smaller, the cap"
-echo "is the answer: every DoM sweep has been placed relative to the wrong boundary."
+echo "Line 4 is the STORAGE boundary: below it a file's data sits on the MDT."
+echo "A grant smaller than requested means the MDT truncated it, and every DoM"
+echo "sweep would be placed against the wrong size."
+echo
+echo "The LATENCY boundary is separate and is not printed by any of the above:"
+echo "it is where the payload stops fitting the open reply buffer, which on this"
+echo "filesystem measured near 112-128 KiB with a fully granted 1 MiB component."
+echo "dom_cutoff locates it empirically, which is the only way to see it."
