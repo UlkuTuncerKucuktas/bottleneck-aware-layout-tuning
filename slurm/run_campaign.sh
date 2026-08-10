@@ -110,6 +110,16 @@ WIDE="$COMMON --cpus-per-task=$CORES_WIDE $GRES_WIDE slurm/single.sbatch"
 NARROW="$COMMON --cpus-per-task=$CORES $GRES_NARROW slurm/single.sbatch"
 MULTI="$COMMON --cpus-per-task=$CORES $GRES_NARROW slurm/multi.sbatch"
 
+# Print the effective configuration before anything is submitted. These come
+# from the environment, so a new shell silently drops them -- and the failure is
+# quiet in the worst way: the campaign runs, but against the default scratch
+# directory, with no partition or account, and its rows mix with an earlier
+# cluster's. Seeing the four values is enough to catch that.
+echo "scratch:   $SCRATCH"
+echo "partition: ${LAYOUT_PARTITION-<site default>}"
+echo "account:   ${LAYOUT_ACCOUNT-<site default>}"
+echo "cores:     $CORES narrow, $CORES_WIDE wide   gres: ${LAYOUT_GRES-gpu:1}"
+echo
 echo "jobid       experiment"
 submit "$WIDE"   stripe_grid
 submit "$WIDE"   cores_vs_throughput

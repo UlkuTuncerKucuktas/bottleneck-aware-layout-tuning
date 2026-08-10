@@ -506,3 +506,17 @@ Each of these appeared only as a submit rejection, never in advance:
     kolyoz-cuda   one GPU per 16 cores
     barbun-cuda   cores must be a multiple of 20
     all           the job's working directory must be under /arf/scratch
+
+## Keep the site settings in a file, not in your shell
+
+The campaign is configured through environment variables, which vanish with the
+shell -- and their absence is quiet rather than loud: the run proceeds against
+the default scratch directory, with no partition or account, and its rows land
+beside another cluster's. `slurm/barbun.env` holds the barbun-cuda values:
+
+    source slurm/barbun.env
+    ./slurm/run_campaign.sh --dry-run
+
+`run_campaign.sh` now prints scratch, partition, account and core counts before
+submitting anything, so a dropped variable is visible in the first four lines
+rather than inferred later from a confusing ledger.
