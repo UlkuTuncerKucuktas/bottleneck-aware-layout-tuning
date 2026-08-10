@@ -65,13 +65,41 @@ def bottleneck_budget():
             seen = rows(f"bottleneck_budget/{shape}/")
             def at(name, key):
                 return median_by(seen, key, layout=name, compute_ms=compute_ms)
-            best = min(arms, key=lambda a: at(a[0], "epoch_s"))[0]
+
+            # A missing arm must not win. median_by returns nan when an arm has
+            # no usable rows, and nan compares false against everything, so a
+            # bare min() keeps whichever arm came first in the list -- which is
+            # "minimal", the answer this experiment exists to test. Naming it
+            # would turn a failed arm into a confirmation.
+            scored = [(n, at(n, "epoch_s")) for n, _ in arms]
+            usable = [(n, v) for n, v in scored if v == v]
+            if len(usable) == len(arms):
+                best = min(usable, key=lambda pair: pair[1])[0]
+            else:
+                missing = [n for n, v in scored if v != v]
+                best = f"undecided ({', '.join(missing)} produced no rows)"
+
             log(f"{shape:>5} compute {compute_ms:>4}ms  epoch  " + "  ".join(
                 f"{n} {at(n, 'epoch_s'):.2f}s" for n, _ in arms)
                 + f"   fastest={best}")
             log(f"{'':>5} {'':>14}  I/O    " + "  ".join(
                 f"{n} {at(n, 'io_s'):.2f}s" for n, _ in arms)
                 + "   objects " + "/".join(f"{at(n, 'ost_objects'):.0f}" for n, _ in arms))
+
+            # What a pipelined loader would see. This loop reads a batch, waits
+            # for it, then computes, so epoch = io + compute by construction --
+            # and adding the same compute to every arm cannot change which is
+            # fastest. A real loader prefetches, so the two overlap and the
+            # epoch approaches max(io, compute): past the crossover the layout
+            # stops mattering at all, which is the claim being tested. Both
+            # bounds are reported because a real pipeline of finite depth sits
+            # between them.
+            overlapped = [(n, max(at(n, "io_s"), at(n, "compute_s"))) for n, _ in arms]
+            spread = [v for _, v in overlapped if v == v]
+            if spread:
+                log(f"{'':>5} {'':>14}  pipelined (max io,compute) " + "  ".join(
+                    f"{n} {v:.2f}s" for n, v in overlapped)
+                    + f"   spread {max(spread) - min(spread):.2f}s")
 
 
 @experiment("mixed_classes")

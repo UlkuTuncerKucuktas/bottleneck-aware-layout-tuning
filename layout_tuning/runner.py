@@ -38,7 +38,20 @@ def log(message):
 
 
 def configure(suffix=""):
-    _state["ledger"] = Ledger(path=f"results{suffix}.jsonl", log_path=f"run{suffix}.log")
+    """Point the run at a ledger. An explicit suffix is for tests only.
+
+    Without one the Ledger names itself after the job, so concurrent jobs in a
+    shared scratch directory keep separate files while still resuming off each
+    other's completed cells.
+    """
+    # The job id always leads, so concurrent jobs never share a file. A suffix
+    # (the rank, under srun) only distinguishes writers WITHIN one job: without
+    # the job id, two concurrent multi-node jobs would both write
+    # results_rank0.jsonl into the same shared scratch directory.
+    job = os.environ.get("SLURM_JOB_ID")
+    stem = f"results_{job}" if job else "results"
+    path = f"{stem}{suffix}.jsonl" if (job or suffix) else None
+    _state["ledger"] = Ledger(path=path, log_path=f"run{suffix}.log")
     return _state["ledger"]
 
 
@@ -69,7 +82,20 @@ def measured(cell, body):
                            "cell_wall_s": elapsed})
         book.log(f"FAILED {cell} after {elapsed:.1f}s: {type(exc).__name__}: {exc}")
         return
-    row.update(counter_delta(before, read_counters(), per=row.get("files", 1)))
+    # A cell that closed its own counter window reports it in the row; that
+    # window ends where the measurement ends. Reading the counters here instead
+    # would include working_dir's cleanup, which unlinks every file the cell
+    # created -- charging the measured phase with a create+unlink cycle it never
+    # performed. Cells that do not close their own window get the wide reading
+    # and are marked, rather than being quietly mixed with the narrow ones.
+    # An empty counter dict is a valid reading -- /proc/fs/lustre is unreadable
+    # on this cluster -- so presence of the key, not its truthiness, decides
+    # whether the cell closed its own window.
+    closed_own = "_counters_at_end" in row
+    after = row.pop("_counters_at_end", None)
+    row["counter_window"] = "measured" if closed_own else "whole-cell"
+    row.update(counter_delta(before, after if closed_own else read_counters(),
+                             per=row.get("files", 1)))
     row["lock_unused_delta"] = lock_unused_count() - locks_before
     row["cell_wall_s"] = time.perf_counter() - started
     book.append(cell, row)
@@ -90,6 +116,60 @@ def median_by(rows, key, **match):
 
 def rows(prefix):
     return ledger().rows(prefix)
+
+
+def _warn_on_mixed_hardware(names):
+    """Refuse to silently extend an experiment measured on other hardware.
+
+    Resume skips cells another job already recorded, which is what makes a long
+    campaign restartable -- but across clusters it silently fills the gaps in one
+    curve with points from a different machine. The filesystem may be shared
+    while the clients are not, and throughput is a client-side quantity, so a
+    scaling curve assembled that way looks clean and means nothing.
+    """
+    here = os.environ.get("SLURM_JOB_PARTITION", "")
+    if not here:
+        return
+    for name in names:
+        elsewhere = {row.get("partition") for row in ledger().rows(f"{name}/")}
+        elsewhere.discard(here)
+        elsewhere.discard(None)
+        elsewhere.discard("")
+        if elsewhere:
+            log(f"WARNING: {name} already has rows from partition(s) "
+                f"{', '.join(sorted(elsewhere))}, and this job is on {here}. "
+                "Those cells will be SKIPPED, so the result would mix hardware. "
+                "Point LAYOUT_SCRATCH at a per-cluster directory, or delete "
+                "those rows, before trusting anything from this run.")
+
+
+def _report_eviction_mode():
+    """Say once, up front, whether cold-cache DoM measurement is possible here.
+
+    Without lock eviction the DoM arm is measured with its lock already cached,
+    which produces a plausible number showing no DoM benefit. That reads as a
+    null result rather than as a broken run, so it has to be visible before the
+    hours are spent rather than inferred from the numbers afterwards.
+    """
+    from .layout import drop_client_locks, flush_layout_is_supported
+
+    supported = flush_layout_is_supported()
+    if supported is False:
+        log("WARNING: this Lustre client predates 2.11, where the data-version "
+            "ioctl used a different struct. The DoM write-lock flush will "
+            "silently do nothing and every DoM arm will measure as OST.")
+    elif supported is None:
+        log("note: could not read the Lustre version, so the DoM flush ioctl's "
+            "struct layout is unverified")
+
+    if drop_client_locks():
+        log("eviction: LDLM locks and pages both dropped (DoM measurable cold)")
+    else:
+        log("WARNING: cannot write ldlm.namespaces.*.lru_size, so client locks "
+            "cannot be dropped. Eviction falls back to opening each file, which "
+            "caches the DoM lock and suppresses inlining -- every DoM arm will "
+            "look like an ordinary OST file. DoM results from this run are NOT "
+            "valid. Ask an admin for access, or run the OST-only experiments.")
 
 
 def _preflight():
@@ -165,6 +245,8 @@ def main(argv=None):
         log("note: /proc/fs/lustre counters are unreadable here, so rows carry "
             "phase timings but no per-call attribution")
 
+    _warn_on_mixed_hardware(names)
+    _report_eviction_mode()
     _preflight()
 
     failures = []

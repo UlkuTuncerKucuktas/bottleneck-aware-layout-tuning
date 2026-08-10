@@ -1,6 +1,6 @@
 """Layout definitions and the Lustre commands used to apply them."""
 
-import os, sys, time, array, fcntl, shutil, subprocess
+import os, re, sys, time, array, fcntl, shutil, subprocess
 
 # Override with LAYOUT_SCRATCH to run somewhere else.
 SCRATCH = os.environ.get("LAYOUT_SCRATCH",
@@ -63,25 +63,81 @@ class working_dir:
 
 
 def flush_dom_lock(fd):
+    """Release the file's write lock so the next reader can be served inlined.
+
+    The flag lands at offset 12, matching
+    `struct ioc_data_version {__u64 idv_version; __u32 idv_layout_version;
+    __u32 idv_flags;}`. An older Lustre used two __u64 fields, where the same
+    bytes decode as flags=0x200000000 and `flags & LL_DV_WR_FLUSH` is zero: the
+    ioctl succeeds, returns a data version, and flushes nothing. Nothing in the
+    reply distinguishes the two cases, so the version is checked once against
+    the layout the client actually speaks rather than assumed.
+    """
     buf = array.array('B', bytes(16))
     buf[12:16] = array.array('B', LL_DV_WR_FLUSH.to_bytes(4, sys.byteorder))
     fcntl.ioctl(fd, LL_IOC_DATA_VERSION, buf, True)
 
 
-def evict(paths):
-    """Drop pages without opening the file for reading (that would take the lock).
+def flush_layout_is_supported():
+    """True when this client uses the struct the flush ioctl is built for.
 
-    Cache eviction is what makes a read measurement mean anything, so a
-    platform without posix_fadvise fails here rather than silently returning
-    warm-cache numbers.
+    2.11 introduced the split __u32 layout_version/__u32 flags fields. Below
+    that the flush silently does nothing, which turns every DoM measurement
+    into an ordinary OST measurement without any error to notice.
+    """
+    text = capture("lfs --version")
+    match = re.search(r"(\d+)\.(\d+)", text)
+    if not match:
+        return None
+    major, minor = int(match.group(1)), int(match.group(2))
+    return (major, minor) >= (2, 11)
+
+
+def drop_client_locks():
+    """Release the client's cached LDLM locks. Returns True if it worked.
+
+    Touches no file, so nothing is pre-opened and no lock is re-taken on the way
+    out. Needs write access to /proc/fs/lustre, which an unprivileged user may
+    not have, so the caller gets a boolean rather than an exception and the run
+    can record which kind of eviction it actually got.
+    """
+    dropped = False
+    for namespace in ("*osc*", "*mdc*"):
+        result = subprocess.run(
+            f"lctl set_param -n ldlm.namespaces.{namespace}.lru_size=clear",
+            shell=True, capture_output=True, text=True)
+        dropped = dropped or result.returncode == 0
+    return dropped
+
+
+def evict(paths):
+    """Return the client to a cold state: no cached pages, and no cached locks.
+
+    Dropping pages alone is not enough, and the obvious way of doing it is
+    actively harmful. posix_fadvise(DONTNEED) needs an open descriptor, so a
+    page-only evictor opens every file immediately before the measured read.
+    That open takes the DoM ibits lock and leaves it cached; the next open then
+    finds the lock already held, so the server has no reason to send the file's
+    data inlined in the open reply -- while the pages it would have used are
+    gone. What follows measures a cheap open and an expensive read, which is
+    data-on-MDT behaving exactly like an ordinary OST file. That is how this
+    suite lost a 3.9x DoM effect an earlier script had measured on the same
+    filesystem, the earlier script having never pre-opened anything.
+
+    Locks are therefore dropped through the LDLM namespace instead, which opens
+    nothing. The page-drop path remains only as a fallback for when that is not
+    permitted; it is reported rather than used silently, because a warm DoM
+    measurement reads as a null result rather than as a failure.
     """
     if not hasattr(os, "posix_fadvise"):
         raise RuntimeError(
             "os.posix_fadvise is unavailable, so the page cache cannot be dropped; "
             "these measurements require Linux")
-    for path in paths:
-        fd = os.open(path, os.O_RDONLY)
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        os.close(fd)
+
+    if not drop_client_locks():
+        for path in paths:
+            fd = os.open(path, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
     run("sync")
     time.sleep(0.5)

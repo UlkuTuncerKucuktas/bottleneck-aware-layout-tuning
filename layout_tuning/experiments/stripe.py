@@ -28,16 +28,33 @@ def stripe_grid():
     # repeatedly until the timed region reaches MIN_SECONDS, with the cache
     # dropped before every pass.
     bytes_per_cell = 2 << 30
-    min_seconds = 2.0
+    # 0.5 s, not 2 s. Every pass now reads files no pass has touched, so the
+    # floor can only be met from the data actually written -- 2 s of cold
+    # reading would need roughly 6 GiB per cell, and 400-odd cells of that is
+    # terabytes of writes. Since thread-pool creation was moved out of the
+    # timed region the fixed per-pass cost is microseconds, so a shorter window
+    # is not noisier in the way it once was, and precision comes from REPEATS,
+    # whose cells write fresh files and are therefore independently cold.
+    min_seconds = 0.5
     # 2 GiB of 0.25 MiB files would be 8192 files per cell, which measures
     # metadata rate more than stripe behaviour. 1 GiB is the compromise: 4096
     # files is still a dataloader-shaped set, and each pass is long enough that
     # per-pass RPC latency does not dominate it.
-    cell_bytes = {0.25: 1 << 30, 4: bytes_per_cell}
+    # 64 MiB is the size that separates two effects the smaller ones conflate.
+    # With a 1 MiB stripe, a 0.25 MiB file has its data on one OST at every
+    # width and a 4 MiB file on at most four, so those arms hold data placement
+    # fixed -- yet they still lose 39 % and 25 % respectively as the requested
+    # width rises, because the client fetches and locks a layout entry per
+    # configured target on every open whether or not it holds anything. That is
+    # the cost of asking for width you cannot use, and it is worth measuring on
+    # its own. A 64 MiB file spans every level, so the wider arm can finally
+    # earn something back, and the difference between the two regimes is the
+    # parallelism rather than a difference in overhead.
+    cell_bytes = {0.25: 1 << 30, 4: bytes_per_cell, 64: bytes_per_cell}
     thread_levels = [1, 2, 4, 8, 16, 32]
     stripe_levels = [1, 4, 8, 16, -1]
     for pattern in ["fpw", "shared"]:
-        for size_mib in ([0.25, 4] if pattern == "fpw" else [bytes_per_cell >> 20]):
+        for size_mib in ([0.25, 4, 64] if pattern == "fpw" else [bytes_per_cell >> 20]):
             for stripe_count in stripe_levels:
                 for threads in thread_levels:
                     for repeat in range(REPEATS):
@@ -94,11 +111,19 @@ def stripe_grid():
 
 @experiment("write_path")
 def write_path():
-    """Everything else measures reads. Checkpoints are writes."""
+    """Everything else measures reads. Checkpoints are writes.
+
+    Timed to durability, not to the page cache: a write returns as soon as the
+    data is in client memory, so an unsynced number is a memcpy rate that no
+    layout can change.
+    """
     # Checkpoint writes are the case wide striping is meant for, so the shapes
     # bracket it: many small files (one stripe each, whatever is requested) and
     # one large file that spans the whole sweep.
     bytes_per_cell = 256 << 20
+    # many_small holds placement fixed (a 0.25 MiB file is one object at every
+    # width) and so isolates what the wider layout costs per file; one_large
+    # spans the whole sweep and so shows what it can earn back.
     for label, size_mib, count in [("many_small", 0.25, bytes_per_cell // (256 << 10)),
                                    ("one_large", 256.0, 1)]:
         for stripe_count in [1, 4, 16, -1]:
@@ -111,10 +136,17 @@ def write_path():
                                           f"-c {stripe_count} -S 1M") as directory:
                         paths, wstats = write_files(directory, count,
                                                     int(size_mib * (1 << 20)),
-                                                    flush=False, profile=True)
+                                                    flush=False, profile=True,
+                                                    durable=True)
+                        volume = count * size_mib
                         row = {"shape": label, "stripe_count": stripe_count,
                                "files": len(paths),
-                               "mib_per_s": count * size_mib / wstats["write_wall_s"],
+                               # The durable rate is the filesystem's. The cached
+                               # rate is the client's memory, kept because the
+                               # gap between them says how much of a checkpoint
+                               # burst lands before the layout matters at all.
+                               "mib_per_s": volume / wstats["write_durable_s"],
+                               "cached_mib_per_s": volume / wstats["write_wall_s"],
                                "osts_per_file": osts_per_file(paths[0]), **wstats}
                     return row
 
@@ -122,19 +154,25 @@ def write_path():
         seen = rows(f"write_path/{label}/")
         levels = [1, 4, 16, -1]
         line = [f"{median_by(seen,'mib_per_s',stripe_count=c):.0f}" for c in levels]
+        cached = [f"{median_by(seen,'cached_mib_per_s',stripe_count=c):.0f}" for c in levels]
         held = [f"{median_by(seen,'osts_per_file',stripe_count=c):.0f}" for c in levels]
-        log(f"{label:>11} write MiB/s at 1/4/16/all stripes: "
+        log(f"{label:>11} durable MiB/s at 1/4/16/all stripes: "
             + " ".join(f"{v:>6}" for v in line)
             + "   objects per file: " + "/".join(held))
+        log(f"{'':>11} to client cache (not the filesystem):  "
+            + " ".join(f"{v:>6}" for v in cached))
 
 
 @experiment("cores_vs_throughput")
 def cores_vs_throughput():
-    """Read throughput against cores available, for three stripe widths.
+    """Read throughput against cores available, at a FIXED reader concurrency.
 
-    Reader threads that block in read() hold no core, so thread count and core
-    count are separate resources: `stripe_grid` sweeps threads on a fixed
-    allocation, and this sweeps the allocation itself. A job whose cores are
+    Threads and cores are separate resources -- a thread blocked in read() holds
+    no core -- but tying them together (threads = 2 x cores) confounds them: the
+    result then reproduces the thread sweep `stripe_grid` already does and says
+    nothing about cores. Concurrency is therefore held fixed here while the CPU
+    allocation varies, which is the only way the two axes stay distinct. A job
+    whose cores are
     consumed by computation cannot drive many concurrent reads, so the width
     its layout can actually exploit is bounded by the cores it has spare.
 
@@ -142,9 +180,16 @@ def cores_vs_throughput():
     allocation busy without measuring a thread-count effect instead.
     """
     bytes_per_cell = 2 << 30
-    min_seconds = 2.0
-    file_size = 4 << 20
+    min_seconds = 0.5   # disjoint passes: see stripe_grid for why the floor is short
+    # 64 MiB so a file spans every width under test. At 4 MiB it occupies four
+    # objects at -c 8 and at -c 24 alike, so those two arms would differ only in
+    # per-open layout overhead and the question here -- whether extra
+    # parallelism needs cores to drive it -- could not be answered at all.
+    file_size = 64 << 20
     core_levels = [c for c in [1, 2, 4, 8, 16] if c <= allocated_cores()]
+    # Held constant across every cell so the swept axis is cores alone. 16 is
+    # above the knee stripe_grid found, so concurrency is not itself the limit.
+    fixed_threads = 16
     stripe_levels = [1, 8, -1]
 
     for stripe_count in stripe_levels:
@@ -158,9 +203,10 @@ def cores_vs_throughput():
                         paths, _ = write_files(directory, bytes_per_cell // file_size,
                                                file_size, flush=False)
                         with restricted_to_cores(cores):
-                            elapsed, total, passes = read_until(paths, cores * 2, min_seconds)
+                            elapsed, total, passes = read_until(paths, fixed_threads,
+                                                                min_seconds)
                         row = {"stripe_count": stripe_count, "cores": cores,
-                               "threads": cores * 2, "files": len(paths),
+                               "threads": fixed_threads, "files": len(paths),
                                "read_s": elapsed, "passes": passes,
                                "mib_per_s": total / elapsed / (1 << 20),
                                "osts_per_file": osts_per_file(paths[0])}
@@ -169,7 +215,8 @@ def cores_vs_throughput():
                 measured(cell, body)
 
     seen = rows("cores_vs_throughput/")
-    log("read MiB/s by stripe width x cores available")
+    log(f"read MiB/s by stripe width x cores available "
+        f"(reader threads fixed at {fixed_threads})")
     log("   cores: " + " ".join(f"{c:>7}" for c in core_levels))
     for stripe_count in stripe_levels:
         line = [median_by(seen, "mib_per_s", stripe_count=stripe_count, cores=c)
@@ -217,7 +264,7 @@ def pool_selection():
     # Both read and write, because a capacity tier usually costs more on writes.
     arms = [(pool, f"-p {pool}") for pool in pools]
     file_size, count = 4 << 20, 512
-    min_seconds = 2.0
+    min_seconds = 0.5   # disjoint passes: see stripe_grid for why the floor is short
     widths = [1, 8]
 
     for pool, pool_flag in arms:

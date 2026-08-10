@@ -1,6 +1,6 @@
 """Reading Lustre's own client counters, and timing a read phase by phase."""
 
-import os, time, glob
+import math, os, time, glob
 
 from .layout import CHUNK
 
@@ -63,6 +63,11 @@ def lock_unused_count():
 
 
 # ---------------------------------------------------------------- phase timing
+def _read_counters():
+    from .runner import read_counters
+    return read_counters()
+
+
 def read_file_phases(path, dirfd=None, with_stat=False):
     """Time each syscall in a whole-file read separately.
 
@@ -107,15 +112,34 @@ def read_file_phases(path, dirfd=None, with_stat=False):
 
 
 def distribution(values):
-    """Percentiles, not just a mean: a dataloader waits on its slow reads."""
+    """Percentiles, not just a mean: a dataloader waits on its slow reads.
+
+    Nearest-rank, ceil(p*N) on 1-based ranks. The obvious int(N*p) is one rank
+    too high and, worse, saturates: for N <= 100 it makes p99 the maximum and
+    for N <= 20 it makes p95 the maximum, so a tail figure quoted from a small
+    sample is really the single worst observation.
+
+    A percentile the sample cannot support is omitted rather than approximated,
+    because a p99 that is silently the max reads as a tail measurement and is
+    not one. p99 needs 100 samples, p95 needs 20; below that the key is absent
+    and a caller that needs it sees nothing rather than something wrong.
+    """
     if not values:
         return {}
     ordered = sorted(values)
+    n = len(ordered)
+
     def at(p):
-        return ordered[min(len(ordered) - 1, int(len(ordered) * p))]
-    return {"mean": sum(ordered) / len(ordered), "p50": at(0.50), "p90": at(0.90),
-            "p95": at(0.95), "p99": at(0.99), "max": ordered[-1], "min": ordered[0],
-            "n": len(ordered)}
+        rank = math.ceil(p * n)
+        return ordered[min(n, max(1, rank)) - 1]
+
+    out = {"mean": sum(ordered) / n, "p50": at(0.50),
+           "max": ordered[-1], "min": ordered[0], "n": n}
+    for p, needed in ((0.90, 10), (0.95, 20), (0.99, 100)):
+        if n >= needed:
+            out[f"p{int(p * 100)}"] = at(p)
+    return out
+
 
 
 def profile_reads(paths, with_stat=False):
@@ -131,7 +155,9 @@ def profile_reads(paths, with_stat=False):
     finally:
         os.close(dirfd)
 
-    summary = {}
+    # Close the counter window here, where the reads end. The caller's cleanup
+    # runs later and would otherwise be counted as part of the measurement.
+    summary = {"_counters_at_end": _read_counters()}
     for name, values in collected.items():
         for stat_name, stat_value in distribution(values).items():
             summary[f"{name}_{stat_name}"] = stat_value

@@ -167,3 +167,188 @@ Before any measurement, `_preflight` writes a plain file and a DoM file, reads
 back the granted stripe width, drops the cache and flushes a DoM lock. Each check
 corresponds to something that has produced wrong numbers or a late crash here, so
 a broken environment fails in seconds rather than hours.
+
+## What the MDT grants is not what you asked for
+
+`lfs setstripe -E 1M -L mdt` requests a 1 MiB data-on-MDT component, but the
+server caps it at the MDT's `dom_stripesize`, so files can get far less. An
+earlier run requesting 1M cliffed between 112 and 128 KiB, which means the
+boundary was set by the grant and not by the request.
+
+Every DoM row therefore records `granted_kib`, read back from `lfs getstripe`.
+Without it a flat sweep is ambiguous: it cannot be told apart from a boundary
+sitting outside the swept range, and results from two runs cannot be compared at
+all if the effective component differed between them.
+
+## Flush comparisons need both arms flushed
+
+The data-version ioctl forces data out to the servers, so an unflushed arm is
+read back from the client's own cache. In an earlier run the same OST files
+measured 338.9 us unflushed against 2763.8 us flushed -- an 8x difference from
+the ioctl alone. `flush_cost` therefore flushes its OST arm too, and measures
+what the flush buys within the DoM layout (flushed vs unflushed DoM) rather than
+across layouts, which is what `tail_latency` is for.
+
+## Exclusivity is per-experiment, not a default
+
+`multi.sbatch` does not set `--exclusive`. The two multi-node experiments need
+different things from a node, and the default was blocking the whole campaign.
+
+`mds_scaling` reads single-threaded on each client and measures contention on the
+metadata server, which is shared filesystem-wide whoever else is on the node.
+Exclusivity therefore buys almost nothing while forcing an 8-node job to wait for
+eight nodes to drain simultaneously -- on a partition with 50 of 55 nodes
+allocated, that wait is unbounded, and Slurm gives such a job no start estimate
+at all. Without it the job needs eight nodes with 16 free cores and a free GPU
+each, which partially-used nodes can satisfy.
+
+`neighbour_cost` is the opposite: it measures OST bandwidth interference between
+jobs, so an uninvited co-tenant would land in the middle of the measurement.
+Pass `--exclusive` on its command line, as `run_campaign.sh` does.
+
+## Moving to another cluster
+
+No experiment uses a GPU. The suite measures filesystem behaviour and the node
+acts as a Lustre client, so a `--gres=gpu:1` request is a scheduling tax paid
+only because `kolyoz-cuda` refuses jobs without one. On a CPU partition, drop it:
+
+    sbatch -p <cpu-partition> --gres=NONE -A <account> slurm/single.sbatch <exp>
+
+Two things must be checked before any result from a new cluster is compared with
+an existing one.
+
+**Does it mount the same filesystem?** `df /arf` and `lfs df /arf` on the new
+login node. If `/arf` is absent, the results measure a different filesystem and
+belong in a separate ledger, not appended to this one.
+
+**Is the hardware the same?** Read throughput depends on the client's cores,
+memory bandwidth and network. A number measured on one node type cannot be put
+in the same table as one from another. Every row records `node` and `partition`
+so a mixed ledger can at least be separated afterwards, but the cleaner course
+is one ledger per cluster.
+
+Walltime is a scheduling lever, not a safety margin. Multi-node cells take
+minutes, so `multi.sbatch` asks for 30 of them: the backfill scheduler can slot a
+short job into a gap between larger reservations, while a two-hour request waits
+for a two-hour gap. On a busy partition that difference decides whether an
+8-node job ever starts.
+
+## Concurrent jobs share a scratch directory
+
+Every job runs in the same `$LAYOUT_SCRATCH`, so anything written with a fixed
+name is shared whether or not that was intended. Three things follow, and each
+was a real defect before it was a rule.
+
+Each job writes `results_<jobid>.jsonl`, and under `srun` each rank appends its
+own suffix: `results_<jobid>_rank<n>.jsonl`. The job id has to lead -- a name
+built from the rank alone collides the moment two multi-node jobs run at once,
+since both have a rank 0 in the same directory. Appends are line-atomic so a
+shared file is never corrupted, but resume would then depend on which jobs
+happened to run, and one experiment's rerun could not be separated from
+another's. Resume and analysis both read `results*.jsonl`, so a job still skips
+cells any earlier job completed.
+
+`multi.sbatch` removes only `barrier_$SLURM_JOB_ID_*`. A blanket `rm -f barrier_*`
+at job start deletes the live markers of a concurrent job already waiting at its
+rendezvous, which then blocks to its timeout and records a failure.
+
+`rsync` runs without `--delete`, because a concurrent job may be importing from
+that tree; removing modules under a live interpreter surfaces as unrelated import
+errors. The cost is that a module deleted from the repo would survive in the copy
+indefinitely, so `slurm/reset.sh` removes `$RUNDIR/layout_tuning` outright -- it
+refuses to run while any job is queued, which is what makes that safe.
+
+## A shared filesystem is not a shared machine
+
+The TRUBA clusters mount the same `/arf` -- same MDS and OSS addresses, same
+`lustre1.disk` and `lustre1.flash` pools -- so a run from a different login node
+lands in the same scratch directory and resumes off the same ledger.
+
+That is a hazard, not a convenience. Resume skips cells another job recorded,
+which across clusters means the gaps in one curve get filled with points from
+different client hardware. Throughput is a client-side quantity: cores, memory
+bandwidth and the network adapter all differ between `kolyoz` and `barbun`, and
+a scaling curve assembled from both looks clean while meaning nothing.
+
+Use one scratch directory per cluster:
+
+    export LAYOUT_SCRATCH=/arf/scratch/$USER/layout-tuning-barbun
+
+The runner also warns at startup when an experiment it is about to run already
+has rows from another partition. Filesystem-level results (what DoM costs on the
+MDT, which pool is faster) are portable across clusters; throughput and latency
+numbers are not.
+
+## Why eviction drops locks, not just pages
+
+An adversarial audit traced the loss of this suite's DoM effect to `evict()`.
+Dropping pages needs an open descriptor, so a page-only evictor opens every file
+immediately before the measured read. That open takes the DoM ibits lock and
+leaves it cached; the measured open then finds the lock held, so the server sends
+no inlined data, while the pages it would have used are gone. The result is a
+cheap open and an expensive read -- DoM behaving exactly like an OST file.
+
+The earlier standalone script that measured DoM at 3.9x had no eviction at all,
+and its read function said why: "Opening a file more than once engages Lustre's
+open cache and bypasses the DoM path." Adding cache control reintroduced the very
+pre-open that rule forbids, and the docstring claimed the opposite.
+
+Locks are now released through `ldlm.namespaces.*.lru_size=clear`, which opens
+nothing. The page-drop path remains only as a fallback, and the runner says at
+startup which mode it got -- a fallback run produces DoM numbers that read as a
+null result rather than as a failure.
+
+## Three parsing and arithmetic defects the same audit found
+
+`osts_per_file` harvested integers from `lfs getstripe -c`, which prints the whole
+layout for a composite file. The largest token in a DoM file's output is 1048576 --
+the component boundary in bytes -- so every DoM arm reported a million objects per
+file. It now sums `--stripe-count` across components.
+
+`distribution` indexed percentiles with `int(N*p)`, one rank too high and
+saturating: p99 was literally the maximum for every N <= 100, p95 for N <= 20. It
+now uses nearest-rank and omits a percentile the sample cannot support.
+
+The counter delta wrapped the whole cell, including `working_dir`'s cleanup, so
+per-file RPC attribution was charged with a create+unlink cycle the measured phase
+never performed. Cells that read through `profile_reads` now close the window
+where the reads end; rows say which window they got.
+
+## Five design defects an adversarial audit found
+
+**The premise experiment could not fail.** Its loop reads a batch, waits, then
+computes, so epoch = io + compute by construction; adding the same compute to
+every arm leaves the ranking untouched, whatever the compute level. A real
+loader prefetches, so the two overlap and the epoch approaches
+max(io, compute) -- and past the crossover the arms become indistinguishable,
+which is the claim the experiment exists to test. Both bounds are now reported.
+A finite prefetch queue sits between them, so the pair brackets reality rather
+than either being the truth.
+
+**A missing arm could win.** median_by returns nan for an arm with no usable
+rows, nan compares false against everything, and min() then keeps whichever arm
+came first -- "minimal", the answer the paper wants. The summary now refuses to
+name a winner unless every arm produced rows, and says which arm was missing.
+
+**Re-reads were not cold.** Reaching the duration floor by reading the same
+files repeatedly warms the servers' caches; evict() clears this client and
+nothing else. The bias was not uniform either: a faster arm needs more passes,
+collects a larger share of warm reads, and looks faster still -- inflating the
+very ratios being measured. Each pass now takes a slice no pass has touched,
+and the floor came down to 0.5 s because cold data is finite. Precision comes
+from REPEATS, whose cells write fresh files.
+
+**Writes were timed to memory.** A write returns once the data is in the
+client's page cache, so any volume that fits in memory measured a memcpy rate
+identical across layouts. write_path now fsyncs before stopping the timer, and
+reports the cached rate alongside: the gap is how much of a checkpoint burst
+lands before the layout matters at all.
+
+**Arms that could not differ, and what they measure instead.** With a 1 MiB
+stripe a 0.25 MiB file has its data on one OST at every width, and a 4 MiB file
+on at most four -- so those arms hold placement fixed. They are kept, because
+they still lose 39 % and 25 % as the requested width rises: the client fetches
+and locks a layout entry per configured target on every open, whether or not it
+holds anything. That is the cost of asking for width you cannot use, and it is
+the regime small-file workloads live in. A 64 MiB arm was added alongside so
+that placement can vary too, and the two mechanisms can be told apart.

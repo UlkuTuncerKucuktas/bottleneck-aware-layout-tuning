@@ -80,6 +80,17 @@ else
     echo "no leftover working directories"
 fi
 
+# The copied module tree. multi.sbatch rsyncs WITHOUT --delete, because deleting
+# files under a concurrently running job's interpreter surfaces as unrelated
+# import errors -- so a module removed from the repo would otherwise survive here
+# forever and keep being imported. This is where that copy gets cleared.
+if [ -d layout_tuning ]; then
+    echo "remove stale module tree: $RUNDIR/layout_tuning"
+    [ -z "$DRY" ] && rm -rf layout_tuning
+else
+    echo "no module tree to clear"
+fi
+
 echo
 if [ -n "$DRY" ]; then
     echo "dry run: nothing changed"

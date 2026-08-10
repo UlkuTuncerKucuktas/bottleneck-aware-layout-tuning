@@ -71,10 +71,13 @@ submit "$NARROW" bottleneck_budget
 
 # Metadata scaling is measured against client count, so each width is its own
 # job and they must not overlap.
+# neighbour_cost first: it needs only 2 nodes and it needs them exclusively, so
+# queuing it behind the 8-node job would make a cheap measurement hostage to the
+# most expensive one in the campaign.
+submit "--exclusive -N 2 slurm/multi.sbatch" neighbour_cost
 submit "-N 2 slurm/multi.sbatch" mds_scaling
 submit "-N 4 slurm/multi.sbatch" mds_scaling
 submit "-N 8 slurm/multi.sbatch" mds_scaling
-submit "-N 2 slurm/multi.sbatch" neighbour_cost
 
 echo
 echo "chain submitted. watch with:  squeue -u \$USER"
