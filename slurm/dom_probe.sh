@@ -14,12 +14,24 @@ command -v lfs >/dev/null || {
 }
 DIR="${LAYOUT_SCRATCH:-/arf/scratch/$USER/layout-tuning}/domprobe"
 
-echo "=== 1. what the MDT will grant ==="
-# The requested -E component is capped by this. If it reads ~114688 rather than
-# 1048576, a request of 1M yields a ~112 KiB component -- which is exactly where
-# the earlier run's cliff sat, and it would explain every flat sweep since.
-lctl get_param -n mdt.*.dom_stripesize 2>/dev/null || echo "  (not readable as a user)"
-lctl get_param -n llite.*.inode_cache 2>/dev/null | head -1
+echo "=== 1. the STORAGE boundary: where the data lives ==="
+# lod.*.dom_stripesize is the per-MDT maximum for a DoM component. A larger
+# request is silently truncated to it, so what was asked for is not necessarily
+# what a file got. Default 1 MiB, 64 KiB aligned, 1 GiB ceiling.
+lctl get_param -n lod.*.dom_stripesize 2>/dev/null \
+    || lctl get_param -n mdt.*.dom_stripesize 2>/dev/null \
+    || echo "  (server-side parameter, not readable from a client)"
+
+echo
+echo "=== 1b. the LATENCY boundary: how much arrives with the open ==="
+# A separate mechanism. The MDT ships file data inside the open reply when it
+# fits the reply buffer, so attributes, lock and data arrive in one RPC. Past
+# that the file is still on the MDT but needs a second RPC to read. The limit
+# is reply-buffer space, NOT the component size -- which is why a component
+# granted at 1 MiB can still show a read cliff around 100-130 KiB.
+lctl get_param -n mdc.*.dom_min_repsize 2>/dev/null \
+    || echo "  (dom_min_repsize not exposed on this client)"
+lctl list_param mdc.*.* 2>/dev/null | grep -i dom || true
 
 echo
 echo "=== 2. what a file actually gets ==="

@@ -364,12 +364,61 @@ variables move the whole campaign elsewhere without editing any file:
     LAYOUT_SCRATCH=/arf/scratch/$USER/layout-tuning-barbun \
     ./slurm/run_campaign.sh
 
-`LAYOUT_GRES` set but empty means request no GPU, which is what a CPU partition
-needs. Leaving it unset keeps the GPU request the cuda partitions demand, since
-they reject jobs without one. No experiment uses a GPU either way.
+`LAYOUT_GRES` set but empty emits `--gres=NONE`, which is what a CPU partition
+needs. Omitting the flag would not do: the sbatch scripts carry their own
+`#SBATCH --gres=gpu:1`, and a directive stays in force unless the command line
+overrides it, so a missing flag still requests a GPU. Leaving `LAYOUT_GRES`
+unset keeps the request the cuda partitions demand, since they reject jobs
+without one. No experiment uses a GPU either way.
 
 `LAYOUT_SCRATCH` must differ per cluster. The TRUBA clusters mount the same
 /arf, so a shared directory would let resume fill the gaps in one curve with
 points measured on different client hardware.
 
 Always `--dry-run` first: it prints every sbatch line and submits nothing.
+
+## Data-on-MDT has two boundaries, not one
+
+Confirmed against the Lustre design documentation, not inferred from our
+measurements alone.
+
+**The storage boundary is `lod.*.dom_stripesize`.** It is the per-MDT maximum
+for a DoM component: default 1 MiB, 64 KiB aligned, 1 GiB ceiling, and a larger
+request from `lfs setstripe -E` is silently truncated to it rather than
+refused. Below the boundary a file's data lives in the MDT object; above it,
+the data goes to the OST components. This is what costs metadata capacity.
+Measured on /arf with `slurm/dom_probe.sh`, `-E 1M` is granted in full, so
+nothing here is capped -- but the readback stays, because a truncated grant is
+invisible without it and would silently move the boundary under every sweep.
+
+**The latency boundary is the reply buffer, and it is unrelated.** DoM's speed
+comes from the MDT returning attributes, lock and file data in a single RPC,
+with the data carried in the reply buffer. That only happens while the data
+fits the space left in that buffer. A file past that point is still on the MDT
+and still charged against metadata capacity, but the client must issue a second
+RPC to read it. An earlier run with a fully granted 1 MiB component showed read
+time step from 47 us at 112 KiB to 1323 us at 128 KiB -- nowhere near 1 MiB,
+because the component size was never what governed it.
+
+Files between the two boundaries are inefficient rather than useless, and the
+distinction matters. Measured on this filesystem, DoM at 128 KiB is still 1.75x
+faster than OST; at 112 KiB it is 3.97x. So the benefit does not vanish past the
+cliff, it steps down -- while the MDT capacity consumed keeps growing linearly
+with the file. Speedup earned per KiB of MDT falls to about a third of its value
+at the cliff, and to a sixth by 256 KiB.
+
+Both boundaries exist for good reasons. The storage boundary is a capacity
+decision: an administrator sets how much of the MDT may be spent on file data,
+and 1 MiB is a deliberately generous default. The reply-buffer boundary is a
+protocol constraint: the open reply is a fixed-size message shared with
+attributes and lock information, and past some payload the data simply cannot
+ride along. Neither is a bug, and a file in the band still works correctly and
+still beats OST.
+
+What the band costs is efficiency, which is precisely this work's subject: not
+whether a resource helps, but whether it is still earning what it costs. An
+advisor reasoning only about `dom_stripesize` -- the parameter documentation
+foregrounds, and the only one a user can set -- would place files there believing
+they get the full benefit. `dom_cutoff` brackets both: its sizes span the reply-buffer cliff,
+its components span the storage boundary, and every DoM row records the granted
+component so the two can be separated afterwards.

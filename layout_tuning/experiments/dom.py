@@ -13,11 +13,26 @@ from ..runner import experiment, measured, median_by, rows, log, REPEATS
 @experiment("dom_cutoff")
 def dom_cutoff():
     """Where exactly does inlining stop, and does it move with the -E component?"""
-    # Wide enough to bracket the boundary wherever it lands. An earlier run with
-    # -E 1M cliffed between 112 and 128 KiB, which is far below the 1 MiB asked
-    # for -- so the boundary is set by what the MDT grants, not by the request,
-    # and a grid placed by the requested size can miss it entirely. Each row now
-    # records the granted component so the cliff can be located against it.
+    # There are TWO boundaries, and they are far apart. Measured on this
+    # filesystem, `-E 1M` is granted in full: the storage boundary really is
+    # 1 MiB, and a file below it has its data on the MDT. But an earlier run
+    # with that same layout showed read time jumping 28x between 112 and
+    # 128 KiB, which is where the MDS stops shipping file data inside the open
+    # reply. Above that the file is still on the MDT -- still charged to
+    # metadata capacity -- while the client has to fetch it with a separate
+    # read RPC, so it pays the cost of data-on-MDT and collects none of the
+    # latency benefit. That combination is the worst cell in the design space
+    # and the one an advisor most needs to avoid, so the grid brackets both:
+    # sizes span the read-on-open cliff, components span the storage boundary.
+    #
+    # Above the cliff DoM is still faster than OST -- 1.75x at 128 KiB against
+    # 3.97x at 112 KiB -- so the band is not useless, it is inefficient. The
+    # capacity it costs grows with the file while the speedup steps down, so
+    # the return per KiB of MDT falls to roughly a third of its value at the
+    # cliff and to a sixth by 256 KiB. That is exactly the trade this work is
+    # about: the question is not whether a resource helps but whether it is
+    # still earning what it costs, and the answer changes at a boundary no
+    # parameter exposes.
     sizes_kib = [32, 64, 96, 112, 128, 144, 192, 256, 384]
     for component in ["64K", "256K", "1M"]:
         for size_kib in sizes_kib:

@@ -71,8 +71,12 @@ COMMON=""
 [ -n "${LAYOUT_ACCOUNT-}" ]   && COMMON="$COMMON -A $LAYOUT_ACCOUNT"
 
 if [ "${LAYOUT_GRES-gpu:1}" = "" ]; then
-    GRES_NARROW=""
-    GRES_WIDE=""
+    # --gres=NONE, not an omitted flag. The sbatch scripts carry their own
+    # "#SBATCH --gres=gpu:1", which stays in force unless the command line
+    # overrides it; leaving the flag out would silently keep requesting a GPU
+    # on a partition that has none to give.
+    GRES_NARROW="--gres=NONE"
+    GRES_WIDE="--gres=NONE"
 else
     GRES_NARROW="--gres=${LAYOUT_GRES-gpu:1}"
     # One GPU per 16 cores where the ratio is enforced, so 32 cores needs two.
