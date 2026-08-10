@@ -17,13 +17,14 @@
 # --cpus-per-task and --gres is rejected on a request that is arithmetically
 # fine ("node basina her 20 cekirdek icin 1 GPU talep edilmelidir"). Reusing the
 # same shape as single.sbatch is what makes a probe submittable at all.
-#SBATCH -p kolyoz-cuda
-#SBATCH -A ukucuktas
+# Partition, account, core count and GPU request are deliberately absent: they
+# are site-specific, a directive cannot read a variable, and a stale default
+# here would silently send a probe to the wrong cluster or violate its core
+# quantum. submit_probe.sh supplies all four. A bare `sbatch slurm/probe.sbatch`
+# fails on the missing partition, which is the right kind of failure.
 #SBATCH -J layout-probe
 #SBATCH -N 1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:1
 #SBATCH --exclusive
 #SBATCH --time=00:20:00
 #SBATCH --output=logs/%x-%j.out
