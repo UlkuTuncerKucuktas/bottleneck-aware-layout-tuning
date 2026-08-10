@@ -54,6 +54,17 @@ filesystem's OST count: they are different numbers and the second one flatters
 the footprint figure. `stripe_grid` now records `osts_per_file` in every row so
 the requested and the granted width can be compared.
 
+**On TRUBA, scratch is a flash pool, so every OST arm is flash.** `/arf` has
+two pools, `lustre1.disk` and `lustre1.flash`, of 24 targets each, and
+`/arf/scratch` inherits `flash`. Three things follow. `-c -1` grants 24 objects
+rather than 48 because "all" means all-in-pool, which is correct behaviour and
+not a cap. A file's footprint denominator is the 24 OSTs of its pool, so a
+"fraction of the filesystem" claim has to name the pool. And every DoM-vs-OST
+comparison measured DoM against flash NVMe, which is the harder test: the
+speedup is a lower bound on what the disk pool would give. The runner logs the
+inherited pool on every run so a result set can never be read as
+pool-agnostic.
+
 **Never measure on a login node.** Its client-side cache and lock state carry
 whatever every other logged-in user is doing.
 

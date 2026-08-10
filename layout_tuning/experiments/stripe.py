@@ -3,9 +3,10 @@
 import os, time, shutil
 
 from ..layout import SCRATCH, OST_PLAIN, OST_WIDE, dom_layout, fresh_dir, evict
-from ..io import (write_files, read_many, read_ranges, mdt_used_kib,
+from ..io import (write_files, read_many, read_ranges, read_until, mdt_used_kib,
                   osts_per_file, stat_rate, burn_cpu, restricted_to_cores,
-                  allocated_cores)
+                  allocated_cores, pool_names, pool_members, inherited_pool,
+                  target_inventory)
 from ..probes import profile_reads
 from ..runner import experiment, measured, median_by, rows, log, REPEATS
 
@@ -19,7 +20,17 @@ def stripe_grid():
     # spans four. Wide striping gets its fair test in the shared arm, which reads
     # one cell-sized file spanning every level in the sweep, rather than from a
     # whole-file size large enough to starve the 32-thread cells of files.
-    bytes_per_cell = 256 << 20
+    # A single flash OST already serves ~2.9 GiB/s to one thread, so a few
+    # hundred MiB is read in tens of milliseconds and the measurement captures
+    # thread startup rather than steady-state throughput. Cells therefore read
+    # repeatedly until the timed region reaches MIN_SECONDS, with the cache
+    # dropped before every pass.
+    bytes_per_cell = 2 << 30
+    min_seconds = 2.0
+    # 2 GiB of 0.25 MiB files would be 8192 files per cell, which measures
+    # metadata rate rather than stripe behaviour, so the small arm keeps its
+    # file count and reaches the duration floor by re-reading instead.
+    cell_bytes = {0.25: 256 << 20, 4: bytes_per_cell}
     thread_levels = [1, 2, 4, 8, 16, 32]
     stripe_levels = [1, 4, 8, 16, -1]
     for pattern in ["fpw", "shared"]:
@@ -36,18 +47,21 @@ def stripe_grid():
                                 f"-c {stripe_count} -S 1M")
                             size_bytes = int(size_mib * (1 << 20))
                             if pattern == "fpw":
+                                volume = cell_bytes[size_mib]
                                 paths, wstats = write_files(
-                                    directory, bytes_per_cell // size_bytes, size_bytes,
+                                    directory, volume // size_bytes, size_bytes,
                                     flush=False)
-                                evict(paths)
-                                elapsed, total = read_many(paths, threads)
+                                elapsed, total, passes = read_until(
+                                    paths, threads, min_seconds)
                             else:
                                 paths, wstats = write_files(directory, 1, bytes_per_cell,
                                                             flush=False)
-                                evict(paths)
-                                elapsed, total = read_ranges(paths[0], bytes_per_cell, threads)
+                                elapsed, total, passes = read_until(
+                                    paths, threads, min_seconds,
+                                    reader=lambda ps, n: read_ranges(ps[0], bytes_per_cell, n))
                             row = {"pattern": pattern, "size_mib": size_mib,
                                    "files_per_thread": len(paths) / threads,
+                                   "read_s": elapsed, "passes": passes,
                                    "stripe_count": stripe_count, "threads": threads,
                                    "files": len(paths), "read_s": elapsed,
                                    "mib_per_s": total / elapsed / (1 << 20),
@@ -127,7 +141,8 @@ def cores_vs_throughput():
     Threads are set to twice the core count, which is enough to keep the
     allocation busy without measuring a thread-count effect instead.
     """
-    bytes_per_cell = 256 << 20
+    bytes_per_cell = 2 << 30
+    min_seconds = 2.0
     file_size = 4 << 20
     core_levels = [c for c in [1, 2, 4, 8, 16] if c <= allocated_cores()]
     stripe_levels = [1, 8, -1]
@@ -142,12 +157,11 @@ def cores_vs_throughput():
                                           f"-c {stripe_count} -S 1M")
                     paths, _ = write_files(directory, bytes_per_cell // file_size,
                                            file_size, flush=False)
-                    evict(paths)
                     with restricted_to_cores(cores):
-                        elapsed, total = read_many(paths, threads=cores * 2)
+                        elapsed, total, passes = read_until(paths, cores * 2, min_seconds)
                     row = {"stripe_count": stripe_count, "cores": cores,
                            "threads": cores * 2, "files": len(paths),
-                           "read_s": elapsed,
+                           "read_s": elapsed, "passes": passes,
                            "mib_per_s": total / elapsed / (1 << 20),
                            "osts_per_file": osts_per_file(paths[0])}
                     shutil.rmtree(directory, ignore_errors=True)
@@ -176,3 +190,88 @@ def cores_vs_throughput():
         f"{'all' if c < 0 else c}->{median_by(seen, 'osts_per_file', stripe_count=c):.0f}"
         for c in stripe_levels)
     log(f"   stripes requested->granted: {granted}")
+
+
+@experiment("pool_selection")
+def pool_selection():
+    """What the OST pool a file lands in is worth, at matched stripe widths.
+
+    Pool selection is the fourth layout attribute. Where a filesystem has a
+    flash tier and a capacity tier, the same stripe width means very different
+    throughput, and the cheaper tier may already be fast enough for a workload
+    that is not I/O-bound. Pools are discovered rather than assumed, so this is
+    a no-op where none exist.
+    """
+    inventory = target_inventory()
+    active = sum(1 for entry in inventory if entry["active"])
+    log(f"{len(inventory)} OSTs visible, {active} active")
+    log(f"scratch inherits pool: '{inherited_pool(SCRATCH) or 'none'}'")
+
+    pools = pool_names()
+    if not pools:
+        log("no OST pools on this filesystem, nothing to compare")
+        return
+    for pool in pools:
+        log(f"pool {pool}: {len(pool_members(pool))} members")
+
+    # Each pool at matched widths, so the comparison isolates the medium.
+    # Both read and write, because a capacity tier usually costs more on writes.
+    arms = [(pool, f"-p {pool}") for pool in pools]
+    file_size, count = 4 << 20, 512
+    min_seconds = 2.0
+    widths = [1, 8]
+
+    for pool, pool_flag in arms:
+        for stripe_count in widths:
+            for repeat in range(REPEATS):
+                cell = f"pool_selection/{pool}/{stripe_count}/{repeat}"
+
+                def body(pool=pool, pool_flag=pool_flag, stripe_count=stripe_count):
+                    directory = fresh_dir(f"{SCRATCH}/pool_{pool}_{stripe_count}",
+                                          f"-c {stripe_count} -S 1M {pool_flag}")
+                    paths, wstats = write_files(directory, count, file_size, flush=False)
+                    elapsed, total, passes = read_until(paths, 8, min_seconds)
+                    row = {"pool": pool, "stripe_count": stripe_count,
+                           "files": len(paths), "read_s": elapsed, "passes": passes,
+                           "read_mib_per_s": total / elapsed / (1 << 20),
+                           "write_mib_per_s": (count * file_size / (1 << 20)
+                                               / wstats["write_wall_s"]),
+                           "osts_per_file": osts_per_file(paths[0]),
+                           "granted_pool": inherited_pool(paths[0])}
+                    shutil.rmtree(directory, ignore_errors=True)
+                    return row
+
+                measured(cell, body)
+
+    seen = rows("pool_selection/")
+    log("read / write MiB/s by pool and stripe width")
+    for pool, _ in arms:
+        for stripe_count in widths:
+            log(f"   {pool:>12} -c {stripe_count:<2} "
+                f"read {median_by(seen, 'read_mib_per_s', pool=pool, stripe_count=stripe_count):7.0f}  "
+                f"write {median_by(seen, 'write_mib_per_s', pool=pool, stripe_count=stripe_count):7.0f}  "
+                f"objects {median_by(seen, 'osts_per_file', pool=pool, stripe_count=stripe_count):.0f}")
+
+    # The advisor's question: is a narrow layout on the faster tier better than a
+    # wide one on the slower tier? Which pool is faster is measured, not assumed
+    # from the order `lfs pool_list` happens to return, because reading that
+    # order as fast-first silently inverts the comparison.
+    if len(arms) >= 2:
+        by_speed = sorted(
+            (median_by(seen, "read_mib_per_s", pool=pool, stripe_count=1), pool)
+            for pool, _ in arms)
+        slow_rate, slow = by_speed[0]
+        fast_rate, fast = by_speed[-1]
+        log(f"faster tier at -c 1: {fast} ({fast_rate:.0f} MiB/s) "
+            f"vs {slow} ({slow_rate:.0f} MiB/s)")
+        for stripe_count in widths:
+            a = median_by(seen, "read_mib_per_s", pool=fast, stripe_count=stripe_count)
+            b = median_by(seen, "read_mib_per_s", pool=slow, stripe_count=stripe_count)
+            if a and b:
+                log(f"   -c {stripe_count}: {fast} is {a / b:.2f}x {slow} on reads")
+        narrow_fast = median_by(seen, "read_mib_per_s", pool=fast, stripe_count=1)
+        wide_slow = median_by(seen, "read_mib_per_s", pool=slow, stripe_count=widths[-1])
+        if narrow_fast and wide_slow:
+            log(f"   1 stripe on {fast} vs {widths[-1]} on {slow}: "
+                f"{narrow_fast / wide_slow:.2f}x the throughput for "
+                f"1/{widths[-1]} the objects")

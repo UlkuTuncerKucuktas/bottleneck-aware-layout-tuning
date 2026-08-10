@@ -99,9 +99,18 @@ def main(argv=None):
     log(f"=== {' '.join(names)} | job {os.environ.get('SLURM_JOB_ID', 'local')} "
         f"| node {os.environ.get('SLURMD_NODENAME', 'local')} | rank {rank}/{nodes} ===")
     try:
-        from .io import target_counts
+        from .io import target_counts, pool_names, pool_members, inherited_pool
+        from .layout import SCRATCH
         mdts, osts = target_counts()
         log(f"filesystem has {mdts} MDTs and {osts} OSTs")
+        pools = pool_names()
+        if pools:
+            sizes = ", ".join(f"{name}={len(pool_members(name))}" for name in pools)
+            log(f"pools: {sizes}")
+        # Which pool the measurements land in bounds what -c -1 can grant and
+        # what medium the OST arms actually used, so it belongs in every log.
+        current = inherited_pool(SCRATCH)
+        log(f"measuring in pool: '{current or 'filesystem default'}'")
     except Exception as exc:
         log(f"could not read target counts: {exc}")
 

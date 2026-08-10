@@ -69,6 +69,33 @@ def read_many(paths, threads):
     return time.perf_counter() - started, total
 
 
+def read_until(paths, threads, min_seconds, reader=None):
+    """Read `paths` repeatedly until the timed region lasts `min_seconds`.
+
+    A cell that finishes in tens of milliseconds measures thread startup and
+    first-RPC latency rather than steady-state throughput, and on a flash pool a
+    few hundred MiB is exactly that short. Re-reading the same set keeps the
+    write volume affordable; the cache is dropped before each pass so every pass
+    still goes to the servers.
+
+    Returns (seconds, bytes, passes) so a cell that could not reach the floor is
+    visible in the row rather than silently short.
+    """
+    from .layout import evict
+
+    reader = reader or read_many
+    total_bytes, elapsed, passes = 0, 0.0, 0
+    while elapsed < min_seconds:
+        evict(paths)
+        took, got = reader(paths, threads)
+        elapsed += took
+        total_bytes += got
+        passes += 1
+        if passes >= 50:
+            break
+    return elapsed, total_bytes, passes
+
+
 def read_ranges(path, size_bytes, threads):
     """All threads read disjoint ranges of one file (the checkpoint shape)."""
     fd = os.open(path, os.O_RDONLY)
@@ -138,6 +165,44 @@ def stat_rate(paths):
     for path in paths:
         os.stat(path)
     return len(paths) / (time.perf_counter() - started)
+
+
+def pool_names():
+    """Pools defined on this filesystem, as `lfs pool_list` reports them.
+
+    Returns [] when the filesystem has no pools, which is the common case and
+    not an error: the pool experiment skips itself rather than inventing names.
+    """
+    text = capture(f"lfs pool_list {SCRATCH} 2>/dev/null")
+    names = []
+    for line in text.splitlines()[1:]:
+        token = line.strip()
+        if token and not token.endswith(":"):
+            names.append(token.split(".")[-1])
+    return names
+
+
+def pool_members(pool):
+    text = capture(f"lfs pool_list {pool} 2>/dev/null")
+    return [line.strip() for line in text.splitlines()[1:] if line.strip()]
+
+
+def inherited_pool(path):
+    """The pool a new file in `path` would land in, or '' if none."""
+    text = capture(f"lfs getstripe --pool {path} 2>/dev/null").strip()
+    return text.split()[-1] if text else ""
+
+
+def target_inventory():
+    """Every OST with its index and whether it is active, from `lfs osts`."""
+    entries = []
+    for line in capture(f"lfs osts {SCRATCH}").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].rstrip(":").isdigit():
+            entries.append({"index": int(parts[0].rstrip(":")),
+                            "uuid": parts[1],
+                            "active": "INACTIVE" not in line.upper()})
+    return entries
 
 
 class restricted_to_cores:

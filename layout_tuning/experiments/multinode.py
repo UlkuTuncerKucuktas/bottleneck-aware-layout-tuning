@@ -3,7 +3,7 @@
 import os, time, shutil
 
 from ..layout import SCRATCH, OST_PLAIN, OST_WIDE, dom_layout, fresh_dir, evict
-from ..io import write_files, read_many, osts_per_file
+from ..io import write_files, read_many, read_until, osts_per_file
 from ..probes import profile_reads
 from ..runner import experiment, measured, median_by, rows, log
 
@@ -56,6 +56,7 @@ def neighbour_cost(rank, nodes):
     # 16 MiB files, so the neighbour's wide layout genuinely spreads across OSTs.
     # With small files every arm lands on one OST and there is nothing to measure.
     file_size, file_count = 16 << 20, 128
+    min_seconds = 3.0
     for label, neighbour_layout in [("minimal", OST_PLAIN), ("wide", OST_WIDE)]:
         cell = f"neighbour_cost/{label}/{rank}"
 
@@ -65,10 +66,10 @@ def neighbour_cost(rank, nodes):
             paths, _ = write_files(directory, file_count, file_size, flush=False)
             evict(paths)
             _rendezvous(label, rank, nodes)
-            elapsed, total = read_many(paths, threads=8)
+            elapsed, total, passes = read_until(paths, 8, min_seconds)
             row = {"neighbour_layout": label, "rank": rank, "files": len(paths),
                    "role": "victim" if rank == 0 else "neighbour",
-                   "read_s": elapsed,
+                   "read_s": elapsed, "passes": passes,
                    "mib_per_s": total / elapsed / (1 << 20),
                    "osts_per_file": osts_per_file(paths[0]),
                    "ost_objects": len(paths) * osts_per_file(paths[0])}

@@ -66,6 +66,12 @@ def run():
         ("mdt_used_kib", lambda: 1000),
         ("osts_per_file", lambda path: 4),
         ("write_files", small_write),
+        # pool and target discovery shell out to lfs; stand in with an empty
+        # filesystem so pool_selection takes its documented no-pool path
+        ("pool_names", lambda: []),
+        ("pool_members", lambda pool: []),
+        ("inherited_pool", lambda path: ""),
+        ("target_inventory", lambda: []),
     ])
 
     # Core pinning is Linux-only, like eviction. Off Linux the real call raises

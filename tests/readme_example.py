@@ -49,7 +49,7 @@ def run():
     }
     exec(compile(code, "README.md", "exec"), namespace)
 
-    assert "pool_selection" in registry(), "the snippet did not register an experiment"
+    assert "example_probe" in registry(), "the snippet did not register an experiment"
 
     # Shrink the write and stand in for the lfs calls, exactly as smoke.py does,
     # but leave the snippet's own lines untouched.
@@ -64,12 +64,12 @@ def run():
     if not hasattr(os, "posix_fadvise"):
         namespace["evict"] = lambda paths: None
 
-    registry()["pool_selection"]["fn"].__globals__.update(namespace)
+    registry()["example_probe"]["fn"].__globals__.update(namespace)
 
     os.chdir(WORK)
     from layout_tuning.runner import configure
     configure()
-    main(["pool_selection"])
+    main(["example_probe"])
 
     cells = [line for line in open("results.jsonl")]
     assert len(cells) == 2, f"expected 2 cells, got {len(cells)}"
