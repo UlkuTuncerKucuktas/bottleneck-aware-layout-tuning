@@ -1,23 +1,32 @@
-"""Which eviction strategy lets data-on-MDT be measured cold?
+"""What has to happen between writing a file and reading it, for a cold read?
 
 DoM's benefit is that the open reply carries the file's data, so a working
 measurement shows an expensive open and a nearly free read. If the client
-already holds the file's read lock, the server sends no data with the open and
-the client fetches it separately: a cheap open and an expensive read. The two
-are easy to tell apart, which is what this probe does.
+already holds the file's read lock the server sends nothing with the open and
+the client fetches separately: a cheap open and an expensive read. The ratio
+between the two phases tells the cases apart.
 
-Three strategies, on identical freshly written files:
+Two independent factors, crossed:
 
-    none      read straight after writing, no eviction at all
-    flush     the write-flush ioctl on an O_WRONLY fd (no read lock taken)
-    fadvise   open O_RDONLY and drop pages (takes the read lock)
+    write flush   the data-version ioctl on the write descriptor, or not.
+                  Releasing the write lock is what pushes data to the server
+                  and drops the client's cached pages -- Lustre caches under
+                  lock, so surrendering the lock surrenders the cache.
 
-Run it on a compute node, not a login node:
+    after write   nothing / reopen the file O_WRONLY and flush again /
+                  reopen it O_RDONLY and drop pages. Both reopens exist to
+                  answer whether ANY reopen before the measured read defeats
+                  inlining, or only one that takes a read lock.
 
-    sbatch --chdir=$LAYOUT_SCRATCH -p <partition> -A <account> \
-        --cpus-per-task=<n> --wrap "python3 $PWD/slurm/evict_probe.py"
+Crossing them matters because the two were conflated: an arm labelled "no
+eviction" that still flushes at write time cannot show what the write flush
+contributes, and every arm having it makes the control useless for that
+question.
 
-or directly if you have an interactive allocation.
+Run it on a compute node:
+
+    source slurm/barbun.env
+    ./slurm/submit_probe.sh slurm/evict_probe.py
 """
 
 import os
@@ -43,9 +52,9 @@ def fadvise_evict(paths):
         os.close(fd)
 
 
-def measure(layout, label, evictor):
+def measure(layout, label, evictor, write_flush):
     directory = fresh_dir(f"{SCRATCH}/evictprobe_{label}", layout)
-    paths, _ = write_files(directory, COUNT, FILE_KIB << 10, flush=True)
+    paths, _ = write_files(directory, COUNT, FILE_KIB << 10, flush=write_flush)
     if evictor:
         evictor(paths)
     stats = profile_reads(paths)
@@ -60,23 +69,26 @@ def main():
     print(f"{COUNT} files of {FILE_KIB} KiB, medians in microseconds per file")
     print(f"lru_size writable: {drop_client_locks()}")
     print()
-    print(f"{'layout':>5} {'eviction':>9} {'open':>9} {'read':>9} {'total':>9}   verdict")
+    print(f"{'layout':>5} {'wflush':>6} {'after':>9} {'open':>9} {'read':>9} "
+          f"{'total':>9}   verdict")
 
     results = {}
     for layout, lname in ((dom_layout(), "DoM"), (OST_PLAIN, "OST")):
+      for write_flush in (True, False):
         for ename, evictor in (("none", None),
-                               ("flush", evict_by_flush),
-                               ("fadvise", fadvise_evict)):
+                               ("reopen-w", evict_by_flush),
+                               ("reopen-r", fadvise_evict)):
             # One strategy failing must not cost the rows already measured: the
             # comparison is the point, and a partial table still shows it.
+            wf = "yes" if write_flush else "no"
             try:
-                open_us, read_us, total_us = measure(layout, f"{lname}_{ename}",
-                                                     evictor)
+                open_us, read_us, total_us = measure(
+                    layout, f"{lname}_{wf}_{ename}", evictor, write_flush)
             except (OSError, RuntimeError) as exc:
-                print(f"{lname:>5} {ename:>9} {'—':>9} {'—':>9} {'—':>9}   "
-                      f"unavailable: {exc}")
+                print(f"{lname:>5} {wf:>6} {ename:>9} {'-':>9} {'-':>9} "
+                      f"{'-':>9}   unavailable: {exc}")
                 continue
-            results[(lname, ename)] = (open_us, read_us, total_us)
+            results[(lname, write_flush, ename)] = (open_us, read_us, total_us)
             # Inlining shows as the open carrying the cost and the read being
             # nearly free. The ratio is what separates the cases; absolute
             # numbers move with load.
@@ -97,17 +109,21 @@ def main():
                     verdict = f"unclear (read/open {ratio:.2f}), likely warm"
             else:
                 verdict = ""
-            print(f"{lname:>5} {ename:>9} {open_us:>9.1f} {read_us:>9.1f} "
-                  f"{total_us:>9.1f}   {verdict}")
+            print(f"{lname:>5} {wf:>6} {ename:>9} {open_us:>9.1f} "
+                  f"{read_us:>9.1f} {total_us:>9.1f}   {verdict}")
 
     print()
-    for ename in ("none", "flush", "fadvise"):
-        if ("DoM", ename) not in results or ("OST", ename) not in results:
-            print(f"  {ename:>7}: incomplete, no comparison")
-            continue
-        dom = results[("DoM", ename)][2]
-        ost = results[("OST", ename)][2]
-        print(f"  {ename:>7}: DoM is {ost / dom:.2f}x OST")
+    for write_flush in (True, False):
+        wf = "yes" if write_flush else "no"
+        for ename in ("none", "reopen-w", "reopen-r"):
+            key_d = ("DoM", write_flush, ename)
+            key_o = ("OST", write_flush, ename)
+            if key_d not in results or key_o not in results:
+                print(f"  wflush={wf:<3} {ename:>9}: incomplete, no comparison")
+                continue
+            dom = results[key_d][2]
+            ost = results[key_o][2]
+            print(f"  wflush={wf:<3} {ename:>9}: DoM is {ost / dom:.2f}x OST")
     print()
     print("A strategy is usable when DoM's read is well under its open AND the")
     print("OST arm is slow enough to show it was measured cold. An OST arm as")

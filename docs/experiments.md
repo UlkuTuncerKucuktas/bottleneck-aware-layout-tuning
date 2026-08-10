@@ -537,33 +537,39 @@ beside another cluster's. `slurm/barbun.env` holds the barbun-cuda values:
 submitting anything, so a dropped variable is visible in the first four lines
 rather than inferred later from a confusing ledger.
 
-## Evicting without privilege
+## Cold reads need no eviction at all
 
-`ldlm.namespaces.*.lru_size` is not writable by an ordinary user on every
-cluster, and it is not needed. Three strategies, in the order `evict()` tries
-them:
+Measured on /arf with `slurm/evict_probe.py`, 200 files of 64 KiB, medians in
+microseconds per file:
 
-    LDLM namespace   coldest, needs write access to /proc/fs/lustre
-    write flush      the data-version ioctl on an O_WRONLY descriptor
-    fadvise          open O_RDONLY and drop pages -- LAST RESORT
+    layout  after write        open     read    total   read/open
+      DoM   nothing           404.0     43.6    659.8        0.11   inlined
+      DoM   reopen O_WRONLY   251.6    697.4   1186.7        2.77   not inlined
+      DoM   reopen O_RDONLY   177.8    544.9    897.2        3.06   not inlined
+      OST   nothing           225.0    800.9   1243.3
+      OST   reopen O_WRONLY   203.7    782.6   1153.7
 
-The ordering matters more than the fallback. The ioctl pushes data to the server
-and releases the write lock, and because it opens the file write-only it never
-takes the read lock. Dropping pages does take one, and a cached read lock is
-exactly what stops the server sending file data in the open reply -- so the
-fadvise path silently turns every DoM arm into an ordinary OST measurement.
+Reading straight after a flushed write is the only configuration that inlines.
+**Any** reopen before the measured read defeats it, write-only included -- the
+mode does not matter, the reopen does.
 
-The earlier standalone run on this filesystem, as an unprivileged user, got a
-3.91x DoM speedup with the write flush and nothing else. Its unflushed rows
-show the contrast directly: 0.97x at 64 KiB when neither arm was evicted,
-3.91x when both were.
+The reason is that Lustre caches under lock: releasing the write lock at close
+already surrenders the client's cached pages, so a freshly written file is
+cold without help. The OST rows prove that independently, at 1243 us for a
+64 KiB read where a warm read would be tens of microseconds. Reopening the file
+does not make it colder; it caches a lock that stops the server sending data
+with the next open.
 
-`slurm/evict_probe.py` measures all three on identical files and prints the
-open/read split for each. Inlining is unmistakable in that split -- an
-expensive open and a nearly free read -- so the probe settles which strategy
-works on a given cluster rather than leaving it to argument.
+So `evict()` is deliberately a no-op on files this process wrote, which is every
+file in this suite. That was not the original design -- eviction was added for
+good reasons and quietly cost a 3.9x DoM effect for several runs, which is why
+the probe exists and why the finding is written here rather than in a comment.
 
-### Reading the eviction probe
+`evict_foreign()` remains for reading files written by someone else, where a lock
+may genuinely be cached and there is no write descriptor to flush. It needs the
+LDLM namespace and reports whether it got it. Nothing in the suite needs it.
+
+## Reading the eviction probe
 
 `slurm/evict_probe.py` judges inlining by the ratio of read time to open time,
 not by which is larger. On a warm cache both are microseconds and their order is

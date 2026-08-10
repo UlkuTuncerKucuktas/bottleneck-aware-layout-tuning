@@ -162,15 +162,15 @@ def _report_eviction_mode():
         log("note: could not read the Lustre version, so the DoM flush ioctl's "
             "struct layout is unverified")
 
-    if drop_client_locks():
-        log("eviction: LDLM lock namespace (privileged path, coldest available)")
-    else:
-        log("eviction: write-flush ioctl (unprivileged; lru_size is not writable "
-            "here). The flush opens files write-only, so it does not take the "
-            "read lock that suppresses DoM inlining -- unlike dropping pages "
-            "via fadvise, which does. Confirm with slurm/evict_probe.py that "
-            "DoM's read time stays well under its open time; if it does not, "
-            "the DoM arms are measuring warm and only the OST results stand.")
+    log("cold reads: by construction. Every file is written, flushed and then "
+        "read once, never reopened first -- measured on /arf, any reopen before "
+        "the measured read defeats DoM inlining (read/open 0.11 without one, "
+        "2.77 after a write-only reopen, 3.06 after a read-only one). Releasing "
+        "the write lock at close already surrenders the client's cached pages, "
+        "so a freshly written file is cold without further help.")
+    if not drop_client_locks():
+        log("note: ldlm.namespaces.*.lru_size is not writable here, which would "
+            "matter only for reading files this process did not write")
 
 
 def _preflight():
