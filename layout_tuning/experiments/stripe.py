@@ -4,7 +4,8 @@ import os, time, shutil
 
 from ..layout import SCRATCH, OST_PLAIN, OST_WIDE, dom_layout, fresh_dir, evict
 from ..io import (write_files, read_many, read_ranges, mdt_used_kib,
-                  osts_per_file, stat_rate, burn_cpu)
+                  osts_per_file, stat_rate, burn_cpu, restricted_to_cores,
+                  allocated_cores)
 from ..probes import profile_reads
 from ..runner import experiment, measured, median_by, rows, log, REPEATS
 
@@ -111,3 +112,67 @@ def write_path():
         log(f"{label:>11} write MiB/s at 1/4/16/all stripes: "
             + " ".join(f"{v:>6}" for v in line)
             + "   objects per file: " + "/".join(held))
+
+
+@experiment("cores_vs_throughput")
+def cores_vs_throughput():
+    """Read throughput against cores available, for three stripe widths.
+
+    Reader threads that block in read() hold no core, so thread count and core
+    count are separate resources: `stripe_grid` sweeps threads on a fixed
+    allocation, and this sweeps the allocation itself. A job whose cores are
+    consumed by computation cannot drive many concurrent reads, so the width
+    its layout can actually exploit is bounded by the cores it has spare.
+
+    Threads are set to twice the core count, which is enough to keep the
+    allocation busy without measuring a thread-count effect instead.
+    """
+    bytes_per_cell = 256 << 20
+    file_size = 4 << 20
+    core_levels = [c for c in [1, 2, 4, 8, 16] if c <= allocated_cores()]
+    stripe_levels = [1, 8, -1]
+
+    for stripe_count in stripe_levels:
+        for cores in core_levels:
+            for repeat in range(REPEATS):
+                cell = f"cores_vs_throughput/{stripe_count}/{cores}/{repeat}"
+
+                def body(stripe_count=stripe_count, cores=cores):
+                    directory = fresh_dir(f"{SCRATCH}/cores_{stripe_count}_{cores}",
+                                          f"-c {stripe_count} -S 1M")
+                    paths, _ = write_files(directory, bytes_per_cell // file_size,
+                                           file_size, flush=False)
+                    evict(paths)
+                    with restricted_to_cores(cores):
+                        elapsed, total = read_many(paths, threads=cores * 2)
+                    row = {"stripe_count": stripe_count, "cores": cores,
+                           "threads": cores * 2, "files": len(paths),
+                           "read_s": elapsed,
+                           "mib_per_s": total / elapsed / (1 << 20),
+                           "osts_per_file": osts_per_file(paths[0])}
+                    shutil.rmtree(directory, ignore_errors=True)
+                    return row
+
+                measured(cell, body)
+
+    seen = rows("cores_vs_throughput/")
+    log("read MiB/s by stripe width x cores available")
+    log("   cores: " + " ".join(f"{c:>7}" for c in core_levels))
+    for stripe_count in stripe_levels:
+        line = [median_by(seen, "mib_per_s", stripe_count=stripe_count, cores=c)
+                for c in core_levels]
+        label = "all" if stripe_count < 0 else str(stripe_count)
+        log(f"   {label:>4}: " + " ".join(f"{v:>7.0f}" for v in line))
+
+    # The number the advisor needs: at each core count, does extra width pay?
+    log("   gain of widest over 1 stripe, per core count:")
+    gains = []
+    for cores in core_levels:
+        one = median_by(seen, "mib_per_s", stripe_count=1, cores=cores)
+        widest = median_by(seen, "mib_per_s", stripe_count=-1, cores=cores)
+        gains.append(widest / one if one else float("nan"))
+    log("         " + " ".join(f"{g:>6.2f}x" for g in gains))
+    granted = " ".join(
+        f"{'all' if c < 0 else c}->{median_by(seen, 'osts_per_file', stripe_count=c):.0f}"
+        for c in stripe_levels)
+    log(f"   stripes requested->granted: {granted}")

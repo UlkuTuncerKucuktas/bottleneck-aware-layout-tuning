@@ -68,6 +68,16 @@ def run():
         ("write_files", small_write),
     ])
 
+    # Core pinning is Linux-only, like eviction. Off Linux the real call raises
+    # a specific error and the smoke run tolerates that one message only.
+    if not hasattr(os, "sched_setaffinity"):
+        print("note: no sched_setaffinity here, running cores_vs_throughput unpinned")
+        import contextlib
+        from layout_tuning import io as io_mod
+        patch([("restricted_to_cores", lambda count: contextlib.nullcontext()),
+               ("allocated_cores", lambda: 4)])
+        io_mod.allocated_cores = lambda: 4
+
     # evict() is deliberately NOT replaced: it is a real code path, it has
     # broken before, and stubbing it is what hid that. Off Linux it raises a
     # specific error, which is the only failure tolerated here.

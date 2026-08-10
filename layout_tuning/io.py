@@ -140,6 +140,43 @@ def stat_rate(paths):
     return len(paths) / (time.perf_counter() - started)
 
 
+class restricted_to_cores:
+    """Run a block as if the job had been allocated only `count` cores.
+
+    Reader threads that block in read() hold no core while waiting, so thread
+    count and core count are different resources. Pinning the process lets one
+    job measure what a smaller allocation could have achieved, which is the
+    quantity a layout has to be sized against.
+    """
+
+    def __init__(self, count):
+        self.count = count
+        self.original = None
+
+    def __enter__(self):
+        if not hasattr(os, "sched_setaffinity"):
+            raise RuntimeError(
+                "os.sched_setaffinity is unavailable, so core count cannot be "
+                "restricted; this measurement requires Linux")
+        self.original = os.sched_getaffinity(0)
+        chosen = sorted(self.original)[:self.count]
+        if len(chosen) < self.count:
+            raise RuntimeError(
+                f"asked for {self.count} cores but only {len(self.original)} are allocated")
+        os.sched_setaffinity(0, set(chosen))
+        return self
+
+    def __exit__(self, *exc):
+        os.sched_setaffinity(0, self.original)
+        return False
+
+
+def allocated_cores():
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
 def burn_cpu(milliseconds):
     """Busy work standing in for an application's compute phase."""
     deadline = time.perf_counter() + milliseconds / 1000.0

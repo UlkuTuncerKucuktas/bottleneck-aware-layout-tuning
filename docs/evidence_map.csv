@@ -2,7 +2,7 @@ contribution,evidence needed,status,covered by
 C1 footprint,MDT bytes per file (DoM),MISSING — lfs df delta per 400 files was noise (negative values),"E2 capacity sweep: 20k files per size, one delta over the whole batch"
 C1 footprint,OST objects per file,partial — stripe_test reads it,E2 records it alongside MDT bytes
 C1 footprint,MDS load,MISSING,"E2 measures create/stat ops per second, DoM vs OST"
-C1 footprint,client RPC concurrency,partial — thread sweep is a proxy,E4 sweeps threads jointly with stripe count
+C1 footprint,client RPC concurrency,partial — thread sweep is a proxy,`stripe_grid` sweeps threads at fixed cores; `cores_vs_throughput` sweeps the core allocation itself
 C2 bottleneck budget,extra I/O gives no end-to-end gain when compute-bound,MISSING — this is the paper's central premise,"E5 synthetic loop: read batch, then spin CPU; vary compute per batch"
 C2 bottleneck budget,saturation knee (marginal gain -> 0),MISSING,E4 reports marginal MiB/s per added stripe/thread
 C3 DoM residency,cutoff location,"done, but bracketed (112,128]",E1 fine sweep 112-128K in 4K steps
@@ -16,3 +16,4 @@ C1 footprint,MDS as a shared bottleneck,"MISSING — 94% of DoM time is open(), 
 C2 bottleneck budget,write-side amortisation of the flush,MISSING,E11 + E7 breakeven read count
 evaluation,"tail latency, not just mean",MISSING,E8 p50/p95/p99 per arm
 evaluation,benefit across repeated epochs,MISSING,E9 four consecutive epochs
+C4 joint tuning,achievable width is bounded by cores available,MISSING — threads and cores are different resources,"`cores_vs_throughput`: pins the process to N cores, sweeps stripe width"
